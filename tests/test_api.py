@@ -804,6 +804,22 @@ class TestWeb(Base):
         s, h, b = self.web("GET", "/", cookie=ck)
         self.assertIn("Compartido", b, "la tarjeta no refleja que ya esta compartido")
 
+    def test_instalar_es_publica_y_dice_como(self):
+        """El hub SOLO tiene que alcanzar para arrancar: /instalar se lee sin cuenta."""
+        s, h, b = self.web("GET", "/instalar")
+        self.assertEqual(s, 200, "la pagina de instalacion tiene que ser publica")
+        self.assertIn("github.com/propiter/artifact-craft", b)
+        self.assertIn("install.sh | bash", b)
+        self.assertIn(self.hub.cfg["base_url"], b, "tiene que nombrar el hub")
+
+    def test_instalar_no_publica_el_codigo_de_equipo(self):
+        """Publicar el codigo ahi convertiria el alta en abierta para cualquiera que llegue al host."""
+        codigo = self.w.roller_team_code(self.hub, "prueba-instalar")
+        s, h, b = self.web("GET", "/instalar")
+        self.assertNotIn(codigo, b, "el codigo de equipo no puede estar en una pagina publica")
+        self.assertNotIn('name="code"', b, "tampoco un campo para escribirlo")
+        self.assertIn("no esta publicado", b.lower().replace("\u00e1", "a"))
+
     def test_admin_solo_para_admin(self):
         s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
         ck = self.cookie_of(h)

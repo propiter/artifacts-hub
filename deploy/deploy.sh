@@ -60,11 +60,39 @@ files() {
   echo "  $n archivo(s), todos regulares"
 }
 
+# La landing que se sirve vive en el VOLUMEN, que nginx monta en /usr/share/nginx/html (la API
+# lo monta en /data: el MISMO volumen, dos puntos de montaje -- de ahi la confusion).
+# Normalmente NO hace falta: el entrypoint de la API copia /www -> /data en CADA arranque, asi que
+# redesplegar ya actualiza la landing. Esto sirve para cambiarla sin rearmar la imagen.
+landing() {
+  C="$(ssh "$SERVER" "docker ps --format '{{.Names}}' | grep '^${APP}-store-1' | head -1")"
+  [ -n "$C" ] || { echo "no encontre el contenedor de la tienda"; exit 1; }
+  for f in "store/www/index.html" "store/www/50x.html"; do
+    [ -f "$ROOT/$f" ] || continue
+    ssh "$SERVER" "cat > /tmp/_l.html" < "$ROOT/$f"
+    ssh "$SERVER" "docker cp /tmp/_l.html $C:/usr/share/nginx/html/$(basename "$f")"
+    l="$(sha256sum "$ROOT/$f" | cut -d' ' -f1)"
+    r="$(ssh -n "$SERVER" "docker exec $C sha256sum /usr/share/nginx/html/$(basename "$f")" | cut -d' ' -f1)"
+    [ "$l" = "$r" ] && echo "  OK      $(basename "$f")" || { echo "  DIFIERE $(basename "$f")"; exit 1; }
+  done
+}
+
 case "${1:-all}" in
   files) files ;;
   build) build ;;
   push)  push ;;
   prep)  prep; echo "listo en $FILES_DIR" ;;
+  landing) landing ;;
+  # Aplica el SQL canonico al compose de Dokploy. Necesita dk.sh (skill dokploy), que es quien
+  # sabe hablar con la instancia; se le pasa por DK o por la ruta por defecto.
+  sql)   DK="${DK:-$HOME/.hermes/skills/claude-code-imports/dokploy/assets/dk.sh}"
+         [ -x "$DK" ] || { echo "no encuentro dk.sh; pasalo en DK=/ruta/dk.sh"; exit 1; }
+         "$DK" "$SERVER" sql "$HERE/${APP}-03-update-compose.sql" ;;
+
+  # CUIDADO: el generador escribe ${APP}-03-update-compose.sql. El archivo
+  # ${APP}-update-compose.sql es un LEFTOVER de una version anterior del generador y quedo con la
+  # imagen vieja adentro: aplicarlo devuelve la app a esa version. Por eso `sql` usa la ruta
+  # canonica y no la elige nadie a mano.
   all)   prep; files ;;
-  *) echo "uso: bash deploy/deploy.sh [files|build|push|prep|all]"; exit 1 ;;
+  *) echo "uso: bash deploy/deploy.sh [files|build|push|prep|landing|all]"; exit 1 ;;
 esac

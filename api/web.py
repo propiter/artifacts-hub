@@ -500,6 +500,41 @@ def page_token_once(token, gallery_url, login_url, name):
       </div>""" % (esc(name), esc(token), esc(gallery_url), esc(login_url), esc(login_url)))
 
 
+def page_install(cfg):
+    """La pagina de arranque: el hub SOLO alcanza para empezar.
+
+    Es publica a proposito — hay que poder leerla ANTES de tener cuenta. NO lleva el codigo de
+    equipo: publicarlo aca convertiria el alta en abierta para cualquiera que llegue al hostname.
+    El codigo viaja por el canal privado (el mensaje que manda quien ya esta adentro)."""
+    base = (cfg.get("base_url") or "").rstrip("/")
+    one = "curl -fsSL https://raw.githubusercontent.com/propiter/artifact-craft/main/install.sh | bash"
+    repo = "https://github.com/propiter/artifact-craft"
+    return layout("Instalar", """
+      <h2>Instalar</h2>
+      <p class="sub">Este es el hub de artifacts del equipo. Sirve para entregar <b>paginas</b> —un
+        informe, un tablero, un comparativo, una propuesta— como artifacts publicados con su URL, en
+        vez de archivos sueltos que solo abren en la maquina de quien los hizo.</p>
+      <div class="box">
+        <div class="step"><div class="num">1</div><div><b>Instala el skill en tu Hermes.</b> Un comando:
+          <div class="code">%s</div>
+          <div class="note">Te va a pedir la URL del hub y el <b>codigo de equipo</b>. Ese codigo te lo
+            pasa quien ya esta adentro: no esta publicado aca a proposito. Si preferis no usar la
+            terminal, pegale esto a tu Hermes: <i>instala el skill de artifacts desde</i> <span
+            class="code" style="display:inline">%s</span> <i>y crea mi cuenta; el hub es</i>
+            <span class="code" style="display:inline">%s</span>.</div></div></div>
+        <div class="step"><div class="num">2</div><div><b>Crea tu cuenta.</b> El instalador la crea y
+          guarda tu token en tu maquina: nunca lo copias a mano. Despues te abre tu galeria.</div></div>
+        <div class="step"><div class="num">3</div><div><b>Pedi un artifact.</b> Decile a Hermes "hace un
+          artifact con esto" y te devuelve el link. Para publicar a mano:
+          <div class="code">wl-artifact publish archivo.html mi-slug</div></div></div>
+      </div>
+      <div class="note">Aca no hay catalogo, y no lo va a haber: cada artifact vive en su direccion y
+        <b>el enlace es la credencial</b>. Mandalo a la persona, no al grupo.</div>
+      <div class="warn">Tu token no va nunca en un artifact, en un repo ni en un chat. Si lo perdes,
+        quien administra el hub emite otro.</div>
+    """ % (esc(one), esc(repo), esc(base)))
+
+
 def page_error(msg, code=404):
     return layout("Error", '<h2>%s</h2><p class="sub">%s</p>' % (esc(msg), esc(code)))
 
@@ -514,7 +549,7 @@ def is_app_host(host, cfg):
     return host == want
 
 
-RUTAS_GET = {"/", "/galeria", "/equipo", "/admin", "/entrar", "/unirse"}
+RUTAS_GET = {"/", "/galeria", "/equipo", "/admin", "/entrar", "/unirse", "/instalar"}
 RUTAS_POST = {"/entrar", "/unirse", "/salir", "/compartir", "/borrar", "/codigo"}
 
 
@@ -548,6 +583,10 @@ def serve(handler, hub, method, path, query, form):
     conocidas = RUTAS_GET if method in ("GET", "HEAD") else RUTAS_POST
     if path not in conocidas:
         return out(404, page_error("No existe esa página.", 404))
+
+    # Publica: se lee ANTES de tener cuenta. Va antes del muro de sesion.
+    if method == "GET" and path == "/instalar":
+        return out(200, page_install(cfg))
 
     if method == "GET" and path in ("/entrar", "/unirse"):
         if session:
