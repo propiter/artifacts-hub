@@ -1,0 +1,9 @@
+# SOLO PARA LA PRUEBA LOCAL. No se usa en el despliegue: en daniel, Traefik
+# entra al contenedor por la red de Dokploy y no hace falta publicar puertos.
+services:
+  store:
+    ports:
+      - "18080:80"
+  api:
+    environment:
+      HUB_BASE_URL: http://127.0.0.1:18080

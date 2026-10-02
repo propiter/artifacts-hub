@@ -1,0 +1,55 @@
+# artifacts-hub — almacen de artifacts para varias personas.
+#
+#   store  nginx: sirve la landing, los artifacts y hace de proxy hacia la API
+#   api    tokens, cupos, versiones, auditoria (sin dependencias: stdlib + sqlite)
+#
+# El volumen `hub-data` lo comparten los dos: la API escribe en /data y nginx lo
+# sirve como docroot. Un solo volumen, un solo lugar donde viven los artifacts.
+#
+# Este archivo corre en CUALQUIER lado (docker compose up). La red de Dokploy la
+# inyecta deploy/gen-deploy-sql.py al generar el compose que se despliega: aca no
+# puede estar porque `dokploy-network` es externa y solo existe en el servidor.
+services:
+  store:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    volumes:
+      - hub-data:/usr/share/nginx/html
+      - ./store/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [internal]
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    environment:
+      HUB_DATA: /data
+      HUB_DB: /data/hub.sqlite3
+      HUB_BASE_URL: ${HUB_BASE_URL:-http://127.0.0.1:18080}
+      HUB_MAX_BYTES: ${HUB_MAX_BYTES:-2097152}
+      HUB_MAX_ARTIFACTS: ${HUB_MAX_ARTIFACTS:-200}
+      HUB_RATE_PER_MIN: ${HUB_RATE_PER_MIN:-30}
+      HUB_MAX_APP_PACKED: ${HUB_MAX_APP_PACKED:-12582912}
+      HUB_MAX_APP_UNPACKED: ${HUB_MAX_APP_UNPACKED:-41943040}
+      HUB_MAX_APP_FILES: ${HUB_MAX_APP_FILES:-1000}
+    volumes:
+      - hub-data:/data
+      # las semillas del docroot (landing + 50x). El entrypoint las copia al volumen.
+      - ./store/www:/www:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      internal:
+        # Alias propio: "api" a secas COLISIONA con otros servicios que ya viven en
+        # dokploy-network (Docker devuelve el primero que encuentra y nginx le termina
+        # hablando al contenedor equivocado: 502 con todo reportando "healthy").
+        aliases:
+          - artifactshub-api
+
+networks:
+  internal:
+
+volumes:
+  hub-data:

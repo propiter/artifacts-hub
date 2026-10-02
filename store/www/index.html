@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Artifacts</title>
+<!--
+  Landing ESTATICA del almacen de artifacts (nivel 3 de artifact-craft).
+  REGLA QUE NO SE ROMPE: este archivo se escribe UNA vez y NUNCA se regenera
+  a partir del listado de artifacts. El leak original fue exactamente eso:
+  un index.html regenerado en cada publish, que enumeraba el almacen entero.
+  Si necesitas el catalogo para vos, no va aca: va en wl-artifact catalog (local).
+-->
+<style>
+  :root{--bg:#fff;--fg:#16181d;--muted:#6b7280;--line:rgba(128,128,128,.25);--accent:#3b6ef0}
+  @media (prefers-color-scheme:dark){:root{--bg:#17191d;--fg:#e9eaee;--muted:#9aa1ac;--line:rgba(255,255,255,.14);--accent:#8ab4ff}}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;padding:32px 20px;
+       background:var(--bg);color:var(--fg);
+       font:15px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  main{max-width:520px;width:100%}
+  .mark{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  h1{font-size:22px;line-height:1.25;margin:10px 0 14px}
+  p{margin:0 0 14px;color:var(--muted)}
+  strong{color:var(--fg);font-weight:600}
+  .rule{height:1px;background:var(--line);margin:22px 0}
+  .hint{font-size:13.5px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;
+       background:rgba(128,128,128,.14);padding:1px 5px;border-radius:4px;color:var(--fg)}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">Almacén privado</div>
+  <h1>Este servidor sirve artifacts por enlace directo.</h1>
+  <p>Cada artifact vive en su propia dirección y <strong>no hay catálogo público</strong>.
+     Acá no vas a encontrar una lista: no es que esté escondida, es que no existe.</p>
+  <div class="rule"></div>
+  <p class="hint">Si venís a buscar un artifact, usá el <strong>enlace completo</strong> que te
+     compartieron. La dirección sola no lleva a ningún lado.</p>
+  <p class="hint">Si el enlace es tuyo, tratalo como una credencial: quien lo tenga, entra.</p>
+</main>
+</body>
+</html>

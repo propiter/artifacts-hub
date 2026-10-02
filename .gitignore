@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# datos de infraestructura: no van al repo publico
+deploy/deploy.env
+deploy/*.sql
+deploy/files/
+
+# overrides locales
+docker-compose.override.yml
+.DS_Store
+
+# registros locales (infraestructura)
+*.local.md

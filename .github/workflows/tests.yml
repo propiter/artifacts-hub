@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Sin dependencias: la suite corre con la stdlib. Nada que instalar.
+      - name: Suite de tests
+        run: python3 tests/test_api.py -v
+
+
+  despliegue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # El generador de SQL tiene que seguir produciendo un compose valido y sin build:
+      # si el compose del repo cambia y el generador no lo acompana, esto falla.
+      - name: El generador produce un compose desplegable
+        run: |
+          mkdir -p deploy
+          cat > deploy/deploy.env <<'ENV'
+          APP=ci-check-artifactshub-000000
+          ENVID=0000000000000000000000000
+          HOST=example.invalid
+          IMAGE=registry.example.invalid/ns/artifacts-hub:0.0.0
+          ENV
+          python3 deploy/gen-deploy-sql.py
+          sql=deploy/ci-check-artifactshub-000000-02-compose.sql
+          test -s "$sql"
+          grep -q "registry.example.invalid/ns/artifacts-hub:0.0.0" "$sql" || { echo "no puso la imagen publicada"; exit 1; }
+          grep -q "dokploy-network" "$sql" || { echo "no inyecto dokploy-network"; exit 1; }
+          grep -q "build:" "$sql" && { echo "quedo un build: en el compose desplegable"; exit 1; }
+          echo "generador OK"
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # El compose del repo tiene que ser valido y correr en cualquier lado.
+      - name: docker compose config
+        run: docker compose -f docker-compose.yml config >/dev/null && echo "compose OK"
+
+  nginx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: nginx -t
+        run: |
+          docker run --rm -v "$PWD/store/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:1.27-alpine nginx -t
