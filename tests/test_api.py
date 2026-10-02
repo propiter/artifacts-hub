@@ -753,6 +753,57 @@ class TestWeb(Base):
         self.assertIn("ana", b)
         self.assertIn("de-ana", b)
 
+    def test_compartir_un_artifact_suelto_sin_abrir_el_espacio(self):
+        """Compartir UN artifact: el equipo lo ve, y NO ve el resto del espacio."""
+        self.pub(self.tok_ana, "compartido")
+        self.pub(self.tok_ana, "privado")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        s, h, b = self.web("POST", "/compartir", cookie=ck,
+                           data={"csrf": session["csrf"], "slug": "compartido"})
+        self.assertEqual(s, 303)
+        s, h, b = self.web("GET", "/equipo", cookie=ck)
+        self.assertIn("compartido", b)
+        self.assertNotIn("privado", b, "un artifact suelto no puede abrir el resto del espacio")
+
+    def test_compartir_el_espacio_lo_muestra_entero(self):
+        """Compartir el espacio: se ven todos, sin marcarlos uno por uno."""
+        self.pub(self.tok_ana, "uno-de-ana")
+        self.pub(self.tok_ana, "dos-de-ana")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        self.web("POST", "/compartir", cookie=ck, data={"csrf": session["csrf"]})
+        s, h, b = self.web("GET", "/equipo", cookie=ck)
+        self.assertIn("uno-de-ana", b)
+        self.assertIn("dos-de-ana", b)
+
+    def test_no_puedo_compartir_un_artifact_ajeno(self):
+        self.pub(self.tok_ana, "de-ana")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_beto})
+        ck = self.cookie_of(h)
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        s, h, b = self.web("POST", "/compartir", cookie=ck,
+                           data={"csrf": session["csrf"], "slug": "de-ana"})
+        self.assertEqual(s, 404)
+        s, h, b = self.web("GET", "/equipo", cookie=ck)
+        self.assertNotIn("de-ana", b)
+
+    def test_la_galeria_da_los_dos_controles_de_compartir(self):
+        """El fallo que esto previene: la funcion existe en la API pero no hay boton que la dispare."""
+        self.pub(self.tok_ana, "de-ana")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertIn('action="/compartir"', b, "falta el boton de compartir un artifact")
+        self.assertIn('name="slug"', b)
+        self.assertIn("Compartir mi espacio completo", b, "falta el boton del espacio completo")
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        self.web("POST", "/compartir", cookie=ck, data={"csrf": session["csrf"], "slug": "de-ana"})
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertIn("Compartido", b, "la tarjeta no refleja que ya esta compartido")
+
     def test_admin_solo_para_admin(self):
         s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
         ck = self.cookie_of(h)

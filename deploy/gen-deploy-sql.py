@@ -61,6 +61,7 @@ JOIN project p ON p."projectId" = e."projectId" WHERE c."appName" = :'APP';
 SQL_DOMAIN = """-- ==================== EDITAR ====================
 \\set APP      '{app}'
 \\set HOST     '{host}'
+\\set APPHOST  '{apphost}'
 \\set PORT     '80'
 \\set SVC      'store'
 \\set PATHPFX  '/'

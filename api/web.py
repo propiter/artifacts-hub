@@ -149,7 +149,7 @@ def team_code_ok(hub, code):
 def my_artifacts(hub, user_id):
     with hub.db() as c:
         rows = [dict(r) for r in c.execute(
-            "SELECT a.slug, a.title, a.version, a.bytes, a.created_at, a.updated_at,"
+            "SELECT a.slug, a.title, a.version, a.bytes, a.created_at, a.updated_at, a.shared,"
             "       u.name AS owner"
             "  FROM artifacts a JOIN users u ON u.id = a.user_id"
             " WHERE a.user_id = ? AND a.deleted_at IS NULL ORDER BY a.updated_at DESC", (user_id,))]
@@ -168,15 +168,28 @@ def _with_url(hub, r):
 
 
 def team_spaces(hub):
-    """Espacios compartidos: cada persona que activó 'compartir' con sus artifacts."""
+    """Lo que el equipo ve. Dos formas de compartir, y la diferencia importa:
+
+    - `users.share_team = 1`  -> el espacio ENTERO (todos sus artifacts)
+    - `artifacts.shared = 1`   -> SOLO ese artifact, sin abrir el resto del espacio
+
+    Alguien aparece acá si compartió el espacio o si marcó al menos un artifact. Un espacio
+    compartido no necesita que sus artifacts estén marcados uno por uno: el flag del espacio manda.
+    """
+    cols = ("SELECT slug, title, version, bytes, created_at, updated_at, shared, 'x' AS owner"
+            "  FROM artifacts WHERE user_id = ? AND deleted_at IS NULL")
     with hub.db() as c:
         users = [dict(r) for r in c.execute(
-            "SELECT id, name, display_name FROM users WHERE share_team = 1 ORDER BY name")]
+            "SELECT id, name, display_name, share_team FROM users"
+            " WHERE share_team = 1 OR id IN (SELECT DISTINCT user_id FROM artifacts"
+            "        WHERE shared = 1 AND deleted_at IS NULL)"
+            " ORDER BY name")]
         for u in users:
-            u["artifacts"] = [dict(r) for r in c.execute(
-                "SELECT slug, title, version, bytes, created_at, updated_at, 'x' AS owner"
-                "  FROM artifacts WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC",
-                (u["id"],))]
+            if u["share_team"]:
+                u["artifacts"] = [dict(r) for r in c.execute(cols + " ORDER BY updated_at DESC", (u["id"],))]
+            else:
+                u["artifacts"] = [dict(r) for r in c.execute(
+                    cols + " AND shared = 1 ORDER BY updated_at DESC", (u["id"],))]
     for u in users:
         for a in u["artifacts"]:
             a["owner"] = u["name"]
@@ -262,6 +275,15 @@ tr:last-child td{border-bottom:0}
 .note{margin-top:26px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:14px}
 label{display:block;font-size:13px;color:var(--muted);margin:12px 0 5px}
 .err{background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.35);border-radius:10px;padding:11px 13px;font-size:13.5px;margin:0 0 14px}
+
+  .sharebar {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; margin: 0 0 14px; font-size: 14px;
+  }
+  .sharebar .txt { color: var(--muted); }
+  .sharebar .txt b { color: var(--fg); font-weight: 640; }
+  .btn.on { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); font-weight: 640; }
 """
 
 
@@ -296,6 +318,16 @@ def card(a, show_owner=False, csrf="", can_delete=True):
         owner = '<div class="file">%s · %s</div>' % (esc(a.get("owner", "")), esc(a["slug"]))
     else:
         owner = '<div class="file">%s</div>' % esc(a["slug"] + ("/" if a["kind"] == "app" else ".html"))
+    share_btn = ""
+    if can_delete and csrf:
+        on = bool(a.get("shared"))
+        share_btn = ('<form method="post" action="/compartir" style="display:inline">'
+                     '<input type="hidden" name="csrf" value="%s">'
+                     '<input type="hidden" name="slug" value="%s">'
+                     '<button class="btn%s" title="%s">%s</button></form>'
+                     % (esc(csrf), esc(a["slug"]), " on" if on else "",
+                        "Que el equipo lo vea en «Del equipo»" if not on else "Dejar de compartirlo",
+                        "Compartido" if on else "Compartir"))
     del_btn = ""
     if can_delete and csrf:
         del_btn = ('<form method="post" action="/borrar" style="display:inline" '
@@ -308,10 +340,10 @@ def card(a, show_owner=False, csrf="", can_delete=True):
             '<div class="ttl">%s</div>%s'
             '<div class="row"><span><span class="tag%s">%s</span> v%d · %s</span>'
             '<span class="acts"><a class="btn p" href="%s" target="_blank" rel="noreferrer">Abrir</a>'
-            '%s</span></div></div></article>'
+            '%s%s</span></div></div></article>'
             % (thumb, esc(a.get("title") or a["slug"]), owner,
                " app" if a["kind"] == "app" else "", a["kind"],
-               a["version"], fmt_bytes(a["bytes"]), esc(a["url"]), del_btn))
+               a["version"], fmt_bytes(a["bytes"]), esc(a["url"]), share_btn, del_btn))
 
 
 def page_login(error=None, notice=None):
@@ -363,12 +395,26 @@ def page_gallery(hub, session, arts, notice=None):
                 '<span class="code" style="display:inline-block;margin-top:12px">'
                 'wl-artifact publish mi-pagina.html mi-slug</span></div>')
     total = sum(a["bytes"] for a in arts)
+    share_team = bool(session.get("share_team"))
+    if share_team:
+        txt = ('Tu espacio <b>completo</b> está compartido: el equipo lo ve entero en «Del equipo». '
+               'Los botones de cada tarjeta quedan de más mientras esto esté activo.')
+        btn = "Dejar de compartir mi espacio"
+    else:
+        txt = ('Tu espacio <b>no</b> está compartido. El equipo sólo ve los artifacts que marques '
+               'con <b>Compartir</b> en su tarjeta.')
+        btn = "Compartir mi espacio completo"
+    esp = ('<div class="sharebar"><span class="txt">%s</span>'
+           '<form method="post" action="/compartir" style="display:inline">'
+           '<input type="hidden" name="csrf" value="%s">'
+           '<button class="btn%s">%s</button></form></div>'
+           % (txt, esc(session.get("_csrf", "")), " on" if share_team else "", btn))
     return layout("Mi galería", """
       <h2>Mi galería</h2>
       <p class="sub">%d artifact(s) · %s usados · cada tarjeta tiene su link público: eso es lo que
         compartís, nunca el archivo de tu computadora.</p>
-      %s%s%s""" % (len(arts), fmt_bytes(total), n, '<div class="bar"><input type="search" id="q" '
-                   'placeholder="Buscar…"></div>', body),
+      %s%s%s%s""" % (len(arts), fmt_bytes(total), n, esp,
+                   '<div class="bar"><input type="search" id="q" placeholder="Buscar…"></div>', body),
         session=session, active="galeria") + _FILTER_JS
 
 
@@ -383,7 +429,8 @@ c.style.display=c.textContent.toLowerCase().indexOf(v)>-1?'':'none';});});})();
 def page_team(hub, session, spaces):
     if not spaces:
         body = ('<div class="empty">Nadie está compartiendo su espacio todavía.<br><br>'
-                'En <b>Mi galería</b> podés activar “compartir”, y tu espacio aparece acá.</div>')
+                'En <b>Mi galería</b> podés <b>compartir tu espacio completo</b>, o marcar '
+                '<b>Compartir</b> en la tarjeta de un artifact suelto.</div>')
     else:
         bloques = []
         for u in spaces:
@@ -396,7 +443,7 @@ def page_team(hub, session, spaces):
         body = "".join(bloques)
     return layout("Del equipo", """
       <h2>Del equipo</h2>
-      <p class="sub">Los espacios que cada persona decidió compartir.</p>
+      <p class="sub">Lo que cada persona decidió compartir: su espacio completo, o artifacts sueltos.</p>
       %s""" % body, session=session, active="equipo")
 
 
@@ -553,8 +600,18 @@ def serve(handler, hub, method, path, query, form):
             return out(403, page_error("El formulario venció. Volvé a intentar.", 403))
 
     if method == "POST" and path == "/compartir":
+        slug = (form.get("slug") or [""])[0].strip()
         with hub.db() as c:
-            c.execute("UPDATE users SET share_team = 1 - share_team WHERE id = ?", (session["user_id"],))
+            if slug:
+                # un artifact suelto: se comparte SIN abrir el resto del espacio
+                cur = c.execute("UPDATE artifacts SET shared = 1 - shared"
+                                " WHERE user_id = ? AND slug = ? AND deleted_at IS NULL",
+                                (session["user_id"], slug))
+                if cur.rowcount == 0:
+                    return out(404, page_error("No tenés un artifact con ese nombre.", 404))
+            else:
+                c.execute("UPDATE users SET share_team = 1 - share_team WHERE id = ?",
+                          (session["user_id"],))
         return out(303, "", location="/")
 
     if method == "POST" and path == "/borrar":

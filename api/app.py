@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER,
+  shared INTEGER NOT NULL DEFAULT 0,   -- compartido con el equipo, artifact por artifact
   UNIQUE(user_id, slug)
 );
 CREATE TABLE IF NOT EXISTS versions (
@@ -220,6 +221,9 @@ class Hub:
                 c.execute("ALTER TABLE users ADD COLUMN share_team INTEGER NOT NULL DEFAULT 0")
             if "display_name" not in cols:
                 c.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
+            acols = {r["name"] for r in c.execute("PRAGMA table_info(artifacts)")}
+            if "shared" not in acols:
+                c.execute("ALTER TABLE artifacts ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")
 
     def user_dir(self, name):
         d = os.path.join(self.data, "a", name)
