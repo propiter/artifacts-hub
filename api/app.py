@@ -24,6 +24,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import web as hub_web
+
 MAX_BODY_HARD = 16 * 1024 * 1024
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
 RESERVED = {"index", "50x", "healthz", "api", "a"}
@@ -36,6 +38,9 @@ DEFAULTS = {
     "max_artifacts": int(os.environ.get("HUB_MAX_ARTIFACTS", 200)),
     "rate_per_min": int(os.environ.get("HUB_RATE_PER_MIN", 30)),
     "base_url": os.environ.get("HUB_BASE_URL", ""),
+    # hostname de la INTERFAZ WEB. Tiene que ser distinto al de los artifacts: los artifacts
+    # son HTML de terceros y no pueden compartir origen con la sesion.
+    "app_host": os.environ.get("HUB_APP_HOST", ""),
     # apps (varios archivos): limites del paquete que se sube
     "max_app_packed": int(os.environ.get("HUB_MAX_APP_PACKED", 12 * 1024 * 1024)),
     "max_app_unpacked": int(os.environ.get("HUB_MAX_APP_UNPACKED", 40 * 1024 * 1024)),
@@ -97,6 +102,31 @@ CREATE TABLE IF NOT EXISTS events (
   detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+
+-- INTERFAZ WEB
+CREATE TABLE IF NOT EXISTS sessions (
+  sid TEXT PRIMARY KEY,              -- sha256 del id de la cookie
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  last_seen INTEGER,
+  ip TEXT,
+  csrf TEXT
+);
+CREATE TABLE IF NOT EXISTS login_codes (
+  code TEXT PRIMARY KEY,             -- sha256
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS team_codes (
+  code TEXT PRIMARY KEY,             -- sha256
+  label TEXT,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 
@@ -160,6 +190,7 @@ class Hub:
         self.db_path = cfg["db_path"]
         self.lock = threading.Lock()
         self.rate = {}
+        self.attempts = {}
         os.makedirs(os.path.join(self.data, "a"), exist_ok=True)
         self._init_db()
 
@@ -182,6 +213,13 @@ class Hub:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         with self.db() as c:
             c.executescript(SCHEMA)
+            # Migracion: la base de produccion ya existe, asi que las columnas nuevas se
+            # agregan si faltan (CREATE TABLE IF NOT EXISTS no las agrega).
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+            if "share_team" not in cols:
+                c.execute("ALTER TABLE users ADD COLUMN share_team INTEGER NOT NULL DEFAULT 0")
+            if "display_name" not in cols:
+                c.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
 
     def user_dir(self, name):
         d = os.path.join(self.data, "a", name)
@@ -223,6 +261,26 @@ class Hub:
             "token_id": row["id"], "prefix": row["prefix"], "label": row["label"],
         }
 
+    def check_attempts(self, key, limit=10, window=300):
+        """Frena la fuerza bruta sobre el codigo de equipo. En memoria: alcanza con una replica."""
+        with self.lock:
+            hits = [t for t in self.attempts.get(key, []) if t > time.time() - window]
+            if len(hits) >= limit:
+                raise ApiError(429, "too_many_attempts", "demasiados intentos, esperá unos minutos")
+            hits.append(time.time())
+            self.attempts[key] = hits
+
+    def join(self, name, code, ip=None):
+        if not SLUG_RE.match(name or ""):
+            raise ApiError(400, "bad_name", "el usuario debe ser [a-z0-9-], empezar con letra o numero, max 60")
+        self.check_attempts("join:" + (ip or "?"))
+        if not hub_web.team_code_ok(self, code):
+            raise ApiError(403, "bad_code", "el codigo de equipo no es valido (o fue rotado)")
+        uid = self.ensure_user(name)
+        token = self.mint_token(uid, "cli", ip)
+        self.log("join", name, None, None, None, ip, "por codigo de equipo")
+        return token, uid
+
     def check_rate(self, token_id):
         limit = self.cfg["rate_per_min"]
         if limit <= 0:
@@ -234,6 +292,25 @@ class Hub:
                 raise ApiError(429, "rate_limited", "demasiadas escrituras, esperá un momento")
             hits.append(time.time())
             self.rate[token_id] = hits
+
+    # ---------- cuentas (para la interfaz web) ----------
+    def ensure_user(self, name, is_admin=False):
+        with self.db() as c:
+            row = c.execute("SELECT id FROM users WHERE name = ?", (name,)).fetchone()
+            if row:
+                return row["id"]
+            cur = c.execute("INSERT INTO users (name, is_admin, created_at) VALUES (?,?,?)",
+                            (name, 1 if is_admin else 0, now()))
+            return cur.lastrowid
+
+    def mint_token(self, user_id, label="web", ip=None):
+        """Devuelve el token EN CLARO una sola vez; en la base queda su sha256."""
+        secret = "wlart_" + secrets.token_hex(24)
+        with self.db() as c:
+            c.execute("INSERT INTO tokens (id,prefix,user_id,label,created_at) VALUES (?,?,?,?,?)",
+                      (hashlib.sha256(secret.encode()).hexdigest(), "tok_" + secrets.token_hex(6),
+                       user_id, label, now()))
+        return secret
 
     # ---------- publicar ----------
     def publish(self, ctx, slug, body, title, ip=None):
@@ -559,16 +636,64 @@ class Handler(BaseHTTPRequestHandler):
         return seg, parse_qs(u.query)
 
     # ---------- router ----------
+    def _web(self, method, raw_path, q):
+        """Sirve la interfaz web. Solo cuando el request entra por el hostname de la app."""
+        hub = self.hub
+        form = {}
+        if method == "POST":
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 65536:
+                try:
+                    form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+                except Exception:
+                    form = {}
+        status, ctype, payload, cookie, location = hub_web.serve(self, hub, method, raw_path, q, form)
+        body = payload if isinstance(payload, bytes) else (payload or "").encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # la app es server-rendered; sin inline externo salvo el filtro del buscador
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; frame-src https:; form-action 'self'; base-uri 'none'")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        if location:
+            self.send_header("Location", location)
+        self.end_headers()
+        if method != "HEAD" and body:
+            self.wfile.write(body)
+
     def _handle(self, method):
         hub = self.hub
         ip = self.headers.get("X-Forwarded-For", self.client_address[0])
         try:
             seg, q = self._parts()
+            # ¿viene del hostname de la interfaz web? Entonces la atiende web.py.
+            host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or ""
+            if hub_web.is_app_host(host, hub.cfg):
+                return self._web(method, urlparse(self.path).path, q)
             if seg[:1] == ["healthz"]:
                 return self._send(200, {"ok": True, "ts": now()})
             if seg[:2] != ["api", "v1"]:
                 raise ApiError(404, "not_found", "ruta desconocida")
             rest = seg[2:]
+
+            # la ruta de unirse no lleva token: el codigo de equipo es la credencial
+            if rest == ["join"] and method == "POST":
+                body = json.loads(self._body().decode("utf-8", "replace") or "{}")
+                name = (body.get("name") or "").strip().lower()
+                code = (body.get("code") or "").strip()
+                token, uid = hub.join(name, code, ip)
+                base = hub.cfg.get("app_host") or ""
+                return self._send(201, {"ok": True, "user": name, "token": token,
+                                        "gallery_url": "https://%s/" % base,
+                                        "login_url": "https://%s/e/%s" % (base,
+                                                    hub_web.make_login_code(hub, uid))})
 
             ctx = hub.authenticate(self.headers.get("Authorization"))
 
@@ -580,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
                 route = "list"
             elif rest == ["events"]:
                 route = "events"
+            elif len(rest) == 1 and rest[0] in ("join", "login-link"):
+                route = rest[0]
             elif len(rest) == 2 and rest[0] == "artifacts":
                 route = "one"
             elif len(rest) == 2 and rest[0] == "apps":
@@ -601,6 +728,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(403, "not_admin", "solo un token admin puede ver los de otros")
                 return self._send(200, {"ok": True,
                                         "artifacts": hub.list_artifacts(ctx, all_users=all_users, only_user=only)})
+
+            # ---- link de un solo uso para entrar al navegador SIN escribir el token
+            if route == "login-link":
+                if method != "POST":
+                    raise ApiError(405, "method_not_allowed", "el link se pide con POST")
+                hub.check_attempts("link:" + ctx["token_id"], limit=20)
+                base = hub.cfg.get("app_host") or ""
+                return self._send(200, {"ok": True,
+                                        "url": "https://%s/e/%s" % (base, hub_web.make_login_code(hub, ctx["user_id"])),
+                                        "gallery_url": "https://%s/" % base,
+                                        "expires_in_minutes": hub_web.LOGIN_CODE_MIN})
 
             if route == "events":
                 if method != "GET":
@@ -656,6 +794,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
 
     def do_PUT(self):
         self._handle("PUT")

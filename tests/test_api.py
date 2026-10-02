@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -509,6 +510,271 @@ class TestRecursos(Base):
         despues = len(os.listdir("/proc/self/fd"))
         self.assertLess(despues - antes, 20,
                         "se fugan descriptores: %d -> %d" % (antes, despues))
+
+
+class _SinRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib sigue los 303 por defecto, y asi un test 've' el 200 de la pagina
+    siguiente en vez del redirect que tiene que verificar."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class TestJoinAPI(Base):
+    """El camino que usa Hermes: crear la cuenta sin que la persona copie nada."""
+
+    def test_join_crea_la_cuenta_y_devuelve_token(self):
+        import web as w
+        code = w.roller_team_code(Handler.hub, "test")
+        s, b = self.req("POST", "/api/v1/join", data=json.dumps({"name": "juan", "code": code}).encode(),
+                        ctype="application/json")
+        self.assertEqual(s, 201, b)
+        self.assertTrue(b["token"].startswith("wlart_"))
+        self.assertIn("/e/", b["login_url"], "tiene que traer el link para entrar sin escribir el token")
+        self.assertIn("gallery_url", b)
+        # y ese token sirve para publicar
+        s2, b2 = self.pub(b["token"], "de-juan")
+        self.assertEqual(s2, 201, b2)
+
+    def test_join_sin_codigo_valido(self):
+        s, b = self.req("POST", "/api/v1/join", data=json.dumps({"name": "juan", "code": "malo"}).encode(),
+                        ctype="application/json")
+        self.assertEqual(s, 403)
+        self.assertEqual(b["error"], "bad_code")
+
+    def test_join_con_usuario_invalido(self):
+        import web as w
+        code = w.roller_team_code(Handler.hub, "test")
+        s, b = self.req("POST", "/api/v1/join", data=json.dumps({"name": "Juan Pérez", "code": code}).encode(),
+                        ctype="application/json")
+        self.assertEqual(s, 400)
+        self.assertEqual(b["error"], "bad_name")
+
+    def test_join_no_necesita_token(self):
+        """La ruta de unirse NO lleva Authorization: el codigo es la credencial."""
+        import web as w
+        code = w.roller_team_code(Handler.hub, "test")
+        s, b = self.req("POST", "/api/v1/join", data=json.dumps({"name": "pedro", "code": code}).encode(),
+                        ctype="application/json")
+        self.assertEqual(s, 201)
+        self.assertNotIn("Authorization", json.dumps(b))
+
+    def test_login_link_necesita_token(self):
+        s, b = self.req("POST", "/api/v1/login-link", ctype="application/json", data=b"{}")
+        self.assertEqual(s, 401)
+
+    def test_login_link_con_token(self):
+        s, b = self.req("POST", "/api/v1/login-link", token=self.tok_ana, ctype="application/json", data=b"{}")
+        self.assertEqual(s, 200, b)
+        self.assertIn("/e/", b["url"])
+        self.assertNotIn(self.tok_ana, b["url"], "el link NO puede contener el token")
+
+    def test_el_token_del_join_no_se_guarda_en_claro(self):
+        import web as w
+        code = w.roller_team_code(Handler.hub, "test")
+        s, b = self.req("POST", "/api/v1/join", data=json.dumps({"name": "juan", "code": code}).encode(),
+                        ctype="application/json")
+        tok = b["token"]
+        with Handler.hub.db() as c:
+            dump = " ".join(str(x) for row in c.execute("SELECT * FROM tokens") for x in row)
+        self.assertNotIn(tok, dump)
+        self.assertNotIn(tok.split("_", 1)[1], dump)
+
+
+class TestWeb(Base):
+    """La interfaz web: sesiones, invitaciones, galeria y el aislamiento de origen."""
+    overrides = {"app_host": "app.test"}
+
+    def web(self, method, path, host="app.test", cookie=None, data=None, headers=None):
+        url = self.base + path
+        h = {"Host": host}
+        if cookie:
+            h["Cookie"] = cookie
+        if data is not None:
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+            data = urllib.parse.urlencode(data).encode()
+        if headers:
+            h.update(headers)
+        r = urllib.request.Request(url, data=data, headers=h, method=method)
+        opener = urllib.request.build_opener(_SinRedirect)
+        try:
+            with opener.open(r, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
+
+    def code(self):
+        with self.cfg["_hub"].db() as c:
+            pass
+        import web as w
+        return w.roller_team_code(self.hub, "test")
+
+    def setUp(self):
+        super().setUp()
+        import web as w
+        self.hub = Handler.hub
+        self.w = w
+
+    def cookie_of(self, headers):
+        return headers.get("Set-Cookie", "").split(";")[0]
+
+    # ---- sin sesion
+    def test_sin_sesion_manda_a_entrar(self):
+        s, h, b = self.web("GET", "/")
+        self.assertEqual(s, 303)
+        self.assertIn("/entrar", h.get("Location", ""))
+
+    def test_el_hostname_de_la_app_NO_sirve_artifacts(self):
+        """Lo mas importante: la app y los artifacts no comparten origen."""
+        self.pub(self.tok_ana, "propuesta")
+        s, h, b = self.web("GET", "/a/ana/propuesta.html")
+        self.assertEqual(s, 404, "el hostname de la app no puede servir artifacts")
+
+    def test_la_api_en_el_hostname_de_la_app_tampoco(self):
+        s, h, b = self.web("GET", "/api/v1/artifacts")
+        self.assertEqual(s, 404)
+
+    # ---- crear cuenta con el codigo de equipo
+    def test_unirse_con_codigo_valido(self):
+        code = self.w.roller_team_code(self.hub, "test")
+        s, h, b = self.web("POST", "/unirse", data={"name": "juan", "code": code})
+        self.assertEqual(s, 200, b[:300])
+        self.assertIn("wlart_", b)
+        self.assertIn("app.test/e/", b)
+        ck = self.cookie_of(h)
+        self.assertTrue(ck.startswith("hub_session="))
+        self.assertIn("HttpOnly", h.get("Set-Cookie", ""))
+        self.assertIn("SameSite=Strict", h.get("Set-Cookie", ""))
+        with self.hub.db() as c:
+            row = c.execute("SELECT name FROM users WHERE name='juan'").fetchone()
+        self.assertIsNotNone(row, "no creo el usuario")
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertEqual(s, 200)
+        self.assertIn("Mi galería", b)
+
+    def test_unirse_con_codigo_malo(self):
+        s, h, b = self.web("POST", "/unirse", data={"name": "juan", "code": "no-existe"})
+        self.assertEqual(s, 403)
+
+    def test_unirse_con_usuario_invalido(self):
+        code = self.w.roller_team_code(self.hub, "test")
+        s, h, b = self.web("POST", "/unirse", data={"name": "Juan Pérez", "code": code})
+        self.assertEqual(s, 400)
+
+    def test_rotar_el_codigo_invalida_el_anterior(self):
+        viejo = self.w.roller_team_code(self.hub, "test")
+        nuevo = self.w.roller_team_code(self.hub, "test")
+        s, h, b = self.web("POST", "/unirse", data={"name": "juan", "code": viejo})
+        self.assertEqual(s, 403, "el codigo viejo tiene que quedar revocado")
+        s, h, b = self.web("POST", "/unirse", data={"name": "juan", "code": nuevo})
+        self.assertEqual(s, 200)
+
+    # ---- entrar con token
+    def test_entrar_con_token(self):
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        self.assertEqual(s, 303)
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertEqual(s, 200)
+        self.assertIn("ana", b)
+
+    def test_entrar_con_token_malo(self):
+        s, h, b = self.web("POST", "/entrar", data={"token": "wlart_" + "f" * 48})
+        self.assertEqual(s, 401)
+
+    def test_entrar_con_token_revocado(self):
+        admin.revoke_token(self.cfg, self.pfx_ana)
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        self.assertEqual(s, 401)
+
+    # ---- link de un solo uso
+    def test_link_de_un_solo_uso(self):
+        with self.hub.db() as c:
+            uid = c.execute("SELECT id FROM users WHERE name='ana'").fetchone()["id"]
+        code = self.w.make_login_code(self.hub, uid)
+        s, h, b = self.web("GET", "/e/" + code)
+        self.assertEqual(s, 303)
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertEqual(s, 200)
+        s, h, b = self.web("GET", "/e/" + code)     # segunda vez
+        self.assertEqual(s, 410, "el link tiene que servir UNA sola vez")
+
+    def test_link_vencido(self):
+        import sqlite3
+        with self.hub.db() as c:
+            uid = c.execute("SELECT id FROM users WHERE name='ana'").fetchone()["id"]
+        code = self.w.make_login_code(self.hub, uid)
+        with self.hub.db() as c:
+            c.execute("UPDATE login_codes SET expires_at = ?", (int(time.time()) - 5,))
+        s, h, b = self.web("GET", "/e/" + code)
+        self.assertEqual(s, 410)
+
+    # ---- galeria
+    def test_la_galeria_muestra_lo_propio_y_su_link(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/", cookie=ck)
+        self.assertIn("propuesta", b)
+        self.assertIn("artifacts.test/a/ana/propuesta.html", b)
+        self.assertNotIn("de-beto", b)
+
+    def test_borrar_desde_la_web(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        s, h, b = self.web("POST", "/borrar", cookie=ck, data={"slug": "propuesta", "csrf": session["csrf"]})
+        self.assertEqual(s, 303)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", "ana", "propuesta.html")))
+
+    def test_borrar_sin_csrf_no_pasa(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("POST", "/borrar", cookie=ck, data={"slug": "propuesta"})
+        self.assertEqual(s, 403, "sin csrf tiene que rechazar")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "a", "ana", "propuesta.html")))
+
+    # ---- compartir y vista del equipo
+    def test_compartir_es_opt_in(self):
+        self.pub(self.tok_ana, "de-ana")
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_beto})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/equipo", cookie=ck)
+        self.assertNotIn("ana", b, "sin compartir no deberia aparecer")
+
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        session = self.w.get_session(self.hub, ck.split("=", 1)[1])
+        self.web("POST", "/compartir", cookie=ck, data={"csrf": session["csrf"]})
+        s, h, b = self.web("GET", "/equipo", cookie=ck)
+        self.assertIn("ana", b)
+        self.assertIn("de-ana", b)
+
+    def test_admin_solo_para_admin(self):
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/admin", cookie=ck)
+        self.assertEqual(s, 403)
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_root})
+        ck = self.cookie_of(h)
+        s, h, b = self.web("GET", "/admin", cookie=ck)
+        self.assertEqual(s, 200)
+        self.assertIn("Auditoría", b)
+
+    def test_la_cookie_no_guarda_el_token(self):
+        s, h, b = self.web("POST", "/entrar", data={"token": self.tok_ana})
+        ck = h.get("Set-Cookie", "")
+        self.assertNotIn(self.tok_ana, ck)
+        self.assertNotIn("wlart_", ck)
+
+    def test_csp_en_las_paginas_de_la_app(self):
+        s, h, b = self.web("GET", "/entrar")
+        csp = h.get("Content-Security-Policy", "")
+        self.assertIn("default-src 'none'", csp)
+        self.assertIn("frame-src https:", csp)
 
 
 if __name__ == "__main__":

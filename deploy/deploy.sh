@@ -18,6 +18,10 @@ prep() {
   rm -rf "$FILES_DIR"
   mkdir -p "$FILES_DIR"
   cp -r "$ROOT/store" "$FILES_DIR/store"
+  # el default.conf va tal cual: matchea la app por regex (^app.), asi no hay marcadores
+  # que sustituir ni forma de olvidarse de hacerlo
+  grep -q 'server_name ~^app' "$FILES_DIR/store/default.conf" || {
+    echo "  AVISO: el default.conf no tiene el bloque de la app (^app.)"; }
 }
 
 build() { docker build --platform linux/amd64 -t "$IMAGE" "$ROOT/api"; }

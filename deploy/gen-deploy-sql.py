@@ -77,17 +77,20 @@ SELECT 1/0;
 
 BEGIN;
 
+-- DOS dominios: el de los artifacts (contenido de terceros) y el de la app (sesion).
+-- Tienen que ser distintos: si compartieran origen, el JavaScript de un artifact podria
+-- leer la cookie de sesion de quien mira la galeria.
 INSERT INTO domain (
   "domainId", host, https, port, path, "certificateType",
   "serviceName", "domainType", "internalPath", "stripPath",
   "applicationId", "composeId", "createdAt")
-SELECT
-  pg_temp.nanoid(), :'HOST', (:'CERT' <> 'none'), :'PORT'::int, :'PATHPFX', :'CERT'::"certificateType",
+SELECT pg_temp.nanoid(), h.host, (:'CERT' <> 'none'), :'PORT'::int, :'PATHPFX', :'CERT'::"certificateType",
   NULLIF(:'SVC',''), 'compose'::"domainType", '/', false,
   NULL, c."composeId", pg_temp.now_iso()
 FROM compose c
+CROSS JOIN (VALUES (:'HOST'), (:'APPHOST')) AS h(host)
 WHERE c."appName" = :'APP'
-  AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.host = :'HOST');
+  AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.host = h.host);
 
 COMMIT;
 
@@ -109,7 +112,7 @@ FROM mount m JOIN compose c ON c."composeId" = m."composeId" WHERE c."appName" =
 """
 
 
-def build_deploy_yaml(image, host):
+def build_deploy_yaml(image, host, app_host=""):
     """Devuelve el compose que se despliega: con la imagen publicada y en dokploy-network.
 
     El repo NO puede declarar `dokploy-network` (es externa y solo existe en el servidor),
@@ -141,6 +144,9 @@ def build_deploy_yaml(image, host):
         # http://127.0.0.1:18080/... — la URL del PC, que no le sirve a nadie.
         entorno = svc["api"].setdefault("environment", {})
         entorno["HUB_BASE_URL"] = "https://" + host
+        # el hostname de la app: separa la sesion del contenido de terceros
+        if app_host:
+            entorno["HUB_APP_HOST"] = app_host
 
         # Los binds del repo son `./store/...` (relativo al repo). En Dokploy el compose
         # corre desde `code/` y los archivos viven en `files/`: hay que prefijarlos con
@@ -173,6 +179,8 @@ def build_deploy_yaml(image, host):
     if yaml is None:
         # el dump de PyYAML no existe en este camino: el texto ya es valido
         pass
+    # el compose desplegable no lleva el nombre de host del nginx: se reemplaza aca y en
+    # el default.conf que se sube a files/ (ver deploy.sh)
     cabecera = (
         "# GENERADO por deploy/gen-deploy-sql.py desde docker-compose.yml — no editar a mano.\n"
         "# Diferencias con el del repo: usa la imagen YA PUBLICADA (un compose 'raw' no puede\n"
@@ -201,13 +209,14 @@ def load_env():
 def main():
     e = load_env()
     app, envid, host, image = e["APP"], e["ENVID"], e["HOST"], e["IMAGE"]
+    env_app_host = e.get("APP_HOST") or ("app." + host)
 
-    yaml_texto = build_deploy_yaml(image, host)
+    yaml_texto = build_deploy_yaml(image, host, env_app_host)
 
     (HERE / ("%s-02-compose.sql" % app)).write_text(
         CABECERA + SQL_COMPOSE.format(app=app, envid=envid, yaml=yaml_texto))
     (HERE / ("%s-04-domain.sql" % app)).write_text(
-        CABECERA + SQL_DOMAIN.format(app=app, host=host))
+        CABECERA + SQL_DOMAIN.format(app=app, host=host, apphost=env_app_host))
 
     # filePath es relativo a files/, y files/ es espejo de store/
     archivos = sorted(
@@ -241,7 +250,11 @@ def main():
           "FROM compose WHERE \"appName\" = :'APP';\n" % (app, yaml_texto, image)
     )
 
-    if "127.0.0.1" in yaml_texto or "localhost" in yaml_texto:
+    if not env_app_host:
+        sys.exit("falta APP_HOST (el hostname de la interfaz web, distinto al de los artifacts)")
+    if env_app_host == host:
+        sys.exit("APP_HOST no puede ser igual a HOST: la app y los artifacts NO pueden compartir origen")
+    if ("127.0.0.1" in yaml_texto or "localhost" in yaml_texto) and "HUB_BASE_URL" in yaml_texto:
         sys.exit("el compose desplegable quedo con una URL local: revisar HUB_BASE_URL")
     if ("https://" + host) not in yaml_texto:
         sys.exit("el compose desplegable no lleva la URL publica %s" % host)

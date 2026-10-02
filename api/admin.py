@@ -20,6 +20,7 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from app import Hub, DEFAULTS  # noqa: E402
+from web import roller_team_code, make_login_code  # noqa: E402
 
 
 @contextmanager
@@ -95,6 +96,9 @@ def main():
     pt.add_argument("arg", nargs="?"); pt.add_argument("--label"); pt.add_argument("--days", type=int)
     pt.add_argument("--user")
 
+    pt2 = sub.add_parser("team"); pt2.add_argument("action", choices=["new", "show"])
+    pi = sub.add_parser("invite"); pi.add_argument("name"); pi.add_argument("--days", type=int, default=7)
+
     pe = sub.add_parser("events"); pe.add_argument("--limit", type=int, default=20); pe.add_argument("--user")
     sub.add_parser("stats")
 
@@ -126,6 +130,28 @@ def main():
             for t in list_tokens(cfg, a.user):
                 state = "REVOCADO" if t["revoked_at"] else ("expirado" if t["expires_at"] and t["expires_at"] < time.time() else "activo")
                 print("  %-14s %-10s %-14s %-9s %s" % (t["prefix"], t["name"], t["label"] or "-", state, time.strftime("%Y-%m-%d", time.localtime(t["created_at"]))))
+    elif a.cmd == "team":
+        from web import roller_team_code
+        hub = Hub(cfg)
+        if a.action == "show":
+            with db(cfg) as c:
+                r = c.execute("SELECT label, created_at FROM team_codes WHERE revoked_at IS NULL"
+                              " ORDER BY created_at DESC LIMIT 1").fetchone()
+            print("  hay un codigo activo (creado %s)" % (time.strftime("%Y-%m-%d", time.localtime(r["created_at"])) if r else "-")
+                  if r else "  no hay ningun codigo de equipo activo")
+        else:
+            code = roller_team_code(hub, "cli")
+            print("CODIGO DE EQUIPO (el anterior queda revocado):\n  %s" % code)
+            print("  Pasaselo a tus companeros, o deciles que le pidan a su Hermes:\n"
+                  "    wl-artifact join %s --name su-nombre" % code)
+    elif a.cmd == "invite":
+        from web import make_login_code
+        hub = Hub(cfg)
+        uid = hub.ensure_user(a.name)
+        secret = hub.mint_token(uid, "invite")
+        print("TOKEN de %s (se muestra UNA vez):\n  %s" % (a.name, secret))
+        print("  y un link de un solo uso para que entre al navegador sin copiar nada (vence en 10 min):")
+        print("    https://%s/e/%s" % (cfg.get("app_host") or "app.<tu-dominio>", make_login_code(hub, uid)))
     elif a.cmd == "events":
         with db(cfg) as c:
             q = "SELECT ts,user_name,action,artifact,bytes,detail FROM events"

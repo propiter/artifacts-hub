@@ -1,4 +1,4 @@
-# SOLO PARA LA PRUEBA LOCAL. No se usa en el despliegue: en daniel, Traefik
+# SOLO PARA LA PRUEBA LOCAL. No se usa en el despliegue: en el servidor, Traefik
 # entra al contenedor por la red de Dokploy y no hace falta publicar puertos.
 services:
   store:
@@ -7,3 +7,4 @@ services:
   api:
     environment:
       HUB_BASE_URL: http://127.0.0.1:18080
+      HUB_APP_HOST: app.artifacts.lab.whitelabel.lat
