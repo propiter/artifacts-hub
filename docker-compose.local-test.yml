@@ -7,4 +7,4 @@ services:
   api:
     environment:
       HUB_BASE_URL: http://127.0.0.1:18080
-      HUB_APP_HOST: app.artifacts.lab.whitelabel.lat
+      HUB_APP_HOST: app.localhost
