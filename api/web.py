@@ -259,6 +259,7 @@ color:var(--fg);background:var(--chip);cursor:pointer;white-space:nowrap}
 .tag.app{background:rgba(59,110,240,.16);color:var(--accent)}
 .box{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:24px;box-shadow:var(--shadow);max-width:660px}
 .box h3{margin:0 0 5px;font-size:16px}.box p{margin:0 0 16px;color:var(--muted);font-size:13.5px}
+code,.code,.code a{overflow-wrap:anywhere;word-break:break-word}
 .code{font:12.5px/1.6 ui-monospace,Menlo,monospace;background:var(--soft);border:1px solid var(--line);
 border-radius:9px;padding:11px 13px;word-break:break-all;margin:8px 0}
 .step{display:flex;gap:11px;margin-bottom:15px}
@@ -501,36 +502,37 @@ def page_token_once(token, gallery_url, login_url, name):
 
 
 def page_install(cfg):
-    """La pagina de arranque: el hub SOLO alcanza para empezar.
+    """La página de arranque: el hub SOLO alcanza para empezar.
 
-    Es publica a proposito — hay que poder leerla ANTES de tener cuenta. NO lleva el codigo de
-    equipo: publicarlo aca convertiria el alta en abierta para cualquiera que llegue al hostname.
-    El codigo viaja por el canal privado (el mensaje que manda quien ya esta adentro)."""
+    Es pública a propósito — hay que poder leerla ANTES de tener cuenta. NO lleva el código de
+    equipo: publicarlo acá convertiría el alta en abierta para cualquiera que llegue al hostname.
+    El código viaja por el canal privado (el mensaje de quien ya está adentro)."""
     base = (cfg.get("base_url") or "").rstrip("/")
     one = "curl -fsSL https://raw.githubusercontent.com/propiter/artifact-craft/main/install.sh | bash"
     repo = "https://github.com/propiter/artifact-craft"
     return layout("Instalar", """
       <h2>Instalar</h2>
-      <p class="sub">Este es el hub de artifacts del equipo. Sirve para entregar <b>paginas</b> —un
+      <p class="sub">Este es el hub de artifacts del equipo. Sirve para entregar <b>páginas</b> —un
         informe, un tablero, un comparativo, una propuesta— como artifacts publicados con su URL, en
-        vez de archivos sueltos que solo abren en la maquina de quien los hizo.</p>
+        vez de archivos sueltos que sólo abren en la máquina de quien los hizo.</p>
       <div class="box">
-        <div class="step"><div class="num">1</div><div><b>Instala el skill en tu Hermes.</b> Un comando:
+        <div class="step"><div class="num">1</div><div><b>Instalá el skill en tu Hermes.</b> Un comando:
           <div class="code">%s</div>
-          <div class="note">Te va a pedir la URL del hub y el <b>codigo de equipo</b>. Ese codigo te lo
-            pasa quien ya esta adentro: no esta publicado aca a proposito. Si preferis no usar la
-            terminal, pegale esto a tu Hermes: <i>instala el skill de artifacts desde</i> <span
-            class="code" style="display:inline">%s</span> <i>y crea mi cuenta; el hub es</i>
-            <span class="code" style="display:inline">%s</span>.</div></div></div>
-        <div class="step"><div class="num">2</div><div><b>Crea tu cuenta.</b> El instalador la crea y
-          guarda tu token en tu maquina: nunca lo copias a mano. Despues te abre tu galeria.</div></div>
-        <div class="step"><div class="num">3</div><div><b>Pedi un artifact.</b> Decile a Hermes "hace un
+          <div class="note">Te va a pedir la URL del hub y el <b>código de equipo</b>. Ese código te lo
+            pasa quien ya está adentro: <b>no está publicado acá</b>, a propósito.
+            Si preferís no usar la terminal, pegale esto a tu Hermes:
+            <div class="code" style="margin-top:8px">Instalá el skill de artifacts de Whitelabel y creá
+              mi cuenta. El skill está en %s y el hub es %s. Después abrime la galería.</div>
+          </div></div></div>
+        <div class="step"><div class="num">2</div><div><b>Creá tu cuenta.</b> El instalador la crea y
+          guarda tu token en tu máquina: nunca lo copiás a mano. Después te abre tu galería.</div></div>
+        <div class="step"><div class="num">3</div><div><b>Pedí un artifact.</b> Decile a Hermes "hacé un
           artifact con esto" y te devuelve el link. Para publicar a mano:
           <div class="code">wl-artifact publish archivo.html mi-slug</div></div></div>
       </div>
-      <div class="note">Aca no hay catalogo, y no lo va a haber: cada artifact vive en su direccion y
+      <div class="note">Acá no hay catálogo, y no lo va a haber: cada artifact vive en su dirección y
         <b>el enlace es la credencial</b>. Mandalo a la persona, no al grupo.</div>
-      <div class="warn">Tu token no va nunca en un artifact, en un repo ni en un chat. Si lo perdes,
+      <div class="warn">Tu token no va nunca en un artifact, en un repo ni en un chat. Si lo perdés,
         quien administra el hub emite otro.</div>
     """ % (esc(one), esc(repo), esc(base)))
 
