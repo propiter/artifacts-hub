@@ -11,6 +11,7 @@ Modelo:
   * De la credencial solo se guarda sha256; el log de auditoria nunca guarda el token.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import web as hub_web
+import meta as hub_meta
 
 MAX_BODY_HARD = 16 * 1024 * 1024
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
@@ -45,6 +47,13 @@ DEFAULTS = {
     "max_app_packed": int(os.environ.get("HUB_MAX_APP_PACKED", 12 * 1024 * 1024)),
     "max_app_unpacked": int(os.environ.get("HUB_MAX_APP_UNPACKED", 40 * 1024 * 1024)),
     "max_app_files": int(os.environ.get("HUB_MAX_APP_FILES", 1000)),
+    # ESTADO de un artifact vivo: lo que la pagina guarda y el agente lee.
+    "state_max_bytes": int(os.environ.get("HUB_STATE_MAX_BYTES", 64 * 1024)),
+    "state_writes_per_min": int(os.environ.get("HUB_STATE_WRITES_PER_MIN", 60)),
+    # VISTA PREVIA (og:image) que el cliente genera al publicar.
+    "thumb_max_bytes": int(os.environ.get("HUB_THUMB_MAX_BYTES", 1024 * 1024)),
+    # Secreto para derivar las claves de estado. Vacio = se genera y queda en settings.
+    "state_key_secret": os.environ.get("HUB_STATE_SECRET", ""),
 }
 # Tipos que aceptamos DENTRO de una app. Denylist no: allowlist.
 APP_TYPES = (".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg", ".png", ".jpg", ".jpeg",
@@ -128,6 +137,26 @@ CREATE TABLE IF NOT EXISTS team_codes (
   revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- ESTADO DE UN ARTIFACT VIVO
+-- De la clave NO se guarda nada: se DERIVA con HMAC del secreto del servidor, el dueño, el
+-- slug y un contador. Asi se puede REINYECTAR en cada publicacion sin almacenar material
+-- secreto, y subir `epoch` invalida la anterior sin tocar el resto.
+-- Va por (owner, slug) y no por id para que la clave exista ANTES de que el artifact exista:
+-- la publicacion necesita inyectarla, y el id todavia no esta.
+CREATE TABLE IF NOT EXISTS artifact_keys (
+  owner TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0,
+  revoked_at INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (owner, slug)
+);
+-- Poca cosa de configuracion del propio hub (ej. el secreto generado la primera vez).
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 
@@ -329,7 +358,6 @@ class Hub:
             raise ApiError(413, "too_large", "el artifact supera el limite de %d bytes" % max_bytes)
 
         self.check_rate(ctx["token_id"])
-        sha = hashlib.sha256(body).hexdigest()
         user = ctx["name"]
         d = self.user_dir(user)
         canonical = "%s.html" % slug
@@ -351,10 +379,17 @@ class Hub:
             else:
                 if row["deleted_at"]:
                     raise ApiError(409, "deleted_slug", "ese slug fue borrado; usa otro nombre")
-                if row["sha256"] == sha:
-                    return {"name": canonical, "slug": slug, "version": row["version"],
-                            "sha256": sha, "bytes": len(body), "unchanged": True}
                 version = row["version"] + 1
+
+        # Recien ahora la vista previa y el runtime. Va DESPUES de los chequeos de existencia
+        # para que un slug borrado o alguien pasado de cupo no toquen nada, y ANTES de hashear:
+        # el hash es del cuerpo SERVIDO, asi que republicar lo mismo sigue siendo un no-op.
+        body = self._prepare_page(body, user, slug, title, self.url_for(user, canonical))
+        sha = hashlib.sha256(body).hexdigest()
+
+        if row is not None and row["sha256"] == sha:
+            return {"name": canonical, "slug": slug, "version": row["version"],
+                    "sha256": sha, "bytes": len(body), "unchanged": True}
 
         snapshot = "%s-v%d.html" % (slug, version)
         # escribir el snapshot inmutable primero, despues la canonica (atomico)
@@ -436,6 +471,11 @@ class Hub:
                     if f is None:
                         raise ApiError(400, "bad_member", "no pude leer %s del paquete" % m.name)
                     data = f.read()
+                    # El index de una app tambien lleva su vista previa y su runtime, con las
+                    # MISMAS reglas que una pagina suelta.
+                    if rel.lower() == "index.html":
+                        data = self._prepare_page(data, ctx["name"], slug, extract_title(data),
+                                                  self.url_for(ctx["name"], slug + "/"))
                     total += len(data)
                     if total > self.cfg["max_app_unpacked"]:
                         raise ApiError(413, "too_large", "la app descomprimida supera %d bytes" % self.cfg["max_app_unpacked"])
@@ -521,6 +561,225 @@ class Hub:
             os.fsync(f.fileno())
         os.replace(tmp, path)
 
+    # ---------- vista previa y estado: lo que hace VIVO a un artifact ----------
+    def thumb_path(self, owner, slug):
+        # Hermano del artifact (no adentro: una app es una CARPETA y su arbol se reemplaza
+        # entero en cada deploy). `a/<u>/<slug>.preview.png` no choca con nada y nginx lo
+        # sirve como estatico, sin pasar por la API.
+        return os.path.join(self.user_dir(owner), slug + ".preview.png")
+
+    def thumb_url(self, owner, slug):
+        if not os.path.exists(self.thumb_path(owner, slug)):
+            return None
+        return self.url_for(owner, slug + ".preview.png")
+
+    def _state_path(self, owner, slug):
+        # Dentro de un directorio con punto a proposito: nginx NIEGA cualquier ruta con un
+        # segmento que empieza con punto, asi que el estado no es alcanzable por HTTP directo.
+        return os.path.join(self.user_dir(owner), ".state", slug + ".json")
+
+    def _site_name(self):
+        base = (self.cfg.get("base_url") or "").rstrip("/")
+        return base.split("//")[-1].split("/")[0] or None
+
+    def _state_secret(self):
+        """Con lo que se DERIVAN las claves de estado.
+
+        No se guarda ninguna clave en claro: se recalculan. Por eso reinyectarlas en cada
+        publicacion no obliga a almacenar material secreto en ningun lado. Sale del entorno si
+        esta; si no, se genera una vez y queda en settings (no es una credencial de nadie).
+        """
+        s = (self.cfg.get("state_key_secret") or "").strip()
+        if s:
+            return s.encode()
+        with self.db() as c:
+            row = c.execute("SELECT value FROM settings WHERE key='state_secret'").fetchone()
+            if row is not None:
+                return row["value"].encode()
+            value = secrets.token_hex(32)
+            c.execute("INSERT INTO settings (key,value) VALUES ('state_secret',?)", (value,))
+        return value.encode()
+
+    def _state_key(self, owner, slug, epoch):
+        mac = hmac.new(self._state_secret(),
+                       ("%s:%s:%d" % (owner, slug, epoch)).encode(), hashlib.sha256)
+        return "art_" + mac.hexdigest()[:40]
+
+    def key_epoch(self, owner, slug):
+        """(epoch, revocado) SIN escribir nada. Es lo que usan la publicacion y la
+        verificacion: leer un artifact no tiene por que crearle fila."""
+        with self.db() as c:
+            row = c.execute("SELECT epoch, revoked_at FROM artifact_keys WHERE owner=? AND slug=?",
+                            (owner, slug)).fetchone()
+        if row is None:
+            return 0, False
+        return row["epoch"], bool(row["revoked_at"])
+
+    def key_row(self, owner, slug):
+        """Igual que key_epoch, pero MATERIALIZA la fila. Solo para rotar o apagar: son las
+        operaciones en las que el contador tiene que existir para poder subirlo."""
+        with self.db() as c:
+            row = c.execute("SELECT epoch, revoked_at FROM artifact_keys WHERE owner=? AND slug=?",
+                            (owner, slug)).fetchone()
+            if row is not None:
+                return row["epoch"], bool(row["revoked_at"])
+            c.execute("INSERT INTO artifact_keys (owner, slug, epoch, created_at) VALUES (?,?,0,?)",
+                      (owner, slug, now()))
+        return 0, False
+
+    def rotate_key(self, owner, slug):
+        """Cambia la clave. La vieja muere y la nueva se inyecta al republicar.
+
+        OJO: rotar NO apaga el estado (eso es `revoke_key`). Son cosas distintas: una cambia
+        la credencial, la otra cierra la puerta.
+        """
+        self.key_row(owner, slug)
+        with self.db() as c:
+            c.execute("UPDATE artifact_keys SET epoch=epoch+1, revoked_at=NULL"
+                      " WHERE owner=? AND slug=?", (owner, slug))
+        epoch, _ = self.key_row(owner, slug)
+        return epoch
+
+    def revoke_key(self, owner, slug, off=True):
+        """Apaga (o vuelve a prender) el estado de un artifact.
+
+        Apagado, la proxima publicacion NO inyecta runtime: la pagina deja de poder hablar
+        con el hub. La clave vieja deja de valer en el acto.
+        """
+        self.key_row(owner, slug)
+        with self.db() as c:
+            c.execute("UPDATE artifact_keys SET revoked_at=? WHERE owner=? AND slug=?",
+                      (now() if off else None, owner, slug))
+        return off
+
+    def _prepare_page(self, body, owner, slug, title, url):
+        """El cuerpo tal como se va a servir: vista previa + runtime, inyectados.
+
+        Deterministico a proposito: publicar los mismos bytes con la misma vista previa da el
+        mismo resultado, y por eso la republicacion sigue siendo un no-op.
+        """
+        epoch, revoked = self.key_epoch(owner, slug)
+        runtime = None
+        if not revoked:
+            runtime = {"api": (self.cfg.get("base_url") or "").rstrip("/"), "owner": owner,
+                       "slug": slug, "key": self._state_key(owner, slug, epoch)}
+        return hub_meta.inject(
+            body,
+            title=title,
+            description=hub_meta.description_from(body),
+            url=url,
+            image=self.thumb_url(owner, slug),
+            site=self._site_name(),
+            runtime=runtime,
+        )
+
+    # ---------- vista previa (og:image) ----------
+    def put_thumb(self, ctx, slug, body, ip=None):
+        if not SLUG_RE.match(slug or ""):
+            raise ApiError(400, "bad_slug", "el slug debe ser [a-z0-9-], empezar con letra o numero, max 60")
+        if len(body) < 8 or body[:8] != b"\x89PNG\r\n\x1a\n":
+            raise ApiError(415, "bad_thumb", "la vista previa tiene que ser un PNG")
+        if len(body) > self.cfg["thumb_max_bytes"]:
+            raise ApiError(413, "too_large", "la vista previa supera %d bytes" % self.cfg["thumb_max_bytes"])
+        self.check_rate(ctx["token_id"])
+        self._atomic_write(self.thumb_path(ctx["name"], slug), body)
+        self.log("thumb", ctx["name"], ctx["prefix"], slug, len(body), ip, None)
+        return {"slug": slug, "bytes": len(body),
+                "thumb_url": self.url_for(ctx["name"], slug + ".preview.png"),
+                "note": "se agrega al <head> en la proxima publicacion de la pagina"}
+
+    def delete_thumb(self, ctx, slug, ip=None):
+        p = self.thumb_path(ctx["name"], slug)
+        if not os.path.exists(p):
+            raise ApiError(404, "not_found", "ese artifact no tiene vista previa")
+        os.remove(p)
+        self.log("thumb-rm", ctx["name"], ctx["prefix"], slug, None, ip, None)
+        return {"slug": slug, "removed": True,
+                "note": "el og:image sigue en lo ya publicado hasta que la vuelvas a publicar"}
+
+    # ---------- estado (el artifact que devuelve algo) ----------
+    def artifact_of(self, owner, slug):
+        """Fila del artifact para un (dueño, slug). El dueño es explicito: el slug solo no
+        alcanza, porque dos personas pueden tener el mismo."""
+        slug = re.sub(r"\.html?$", "", slug or "", flags=re.I)
+        with self.db() as c:
+            row = c.execute(
+                "SELECT a.*, u.name AS owner FROM artifacts a JOIN users u ON u.id=a.user_id"
+                " WHERE a.slug=? AND u.name=? AND a.deleted_at IS NULL", (slug, owner)).fetchone()
+        if row is None:
+            raise ApiError(404, "not_found", "no existe ese artifact")
+        return row
+
+    def mine_of(self, ctx, slug):
+        """Fila del artifact por slug, del que firma el token (o de cualquiera si es admin)."""
+        slug = re.sub(r"\.html?$", "", slug or "", flags=re.I)
+        with self.db() as c:
+            if ctx["is_admin"]:
+                row = c.execute(
+                    "SELECT a.*, u.name AS owner FROM artifacts a JOIN users u ON u.id=a.user_id"
+                    " WHERE a.slug=? AND a.deleted_at IS NULL", (slug,)).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT a.*, u.name AS owner FROM artifacts a JOIN users u ON u.id=a.user_id"
+                    " WHERE a.slug=? AND a.user_id=? AND a.deleted_at IS NULL",
+                    (slug, ctx["user_id"])).fetchone()
+        if row is None:
+            raise ApiError(404, "not_found", "no existe ese artifact")
+        return row
+
+    def check_artifact_key(self, owner, slug, key):
+        """Valida una clave de artifact. Tiempo constante: no se filtra por donde falla."""
+        if not key or not key.startswith("art_") or len(key) > 64:
+            raise ApiError(401, "bad_key", "clave de artifact invalida")
+        row = self.artifact_of(owner, slug)
+        epoch, revoked = self.key_epoch(row["owner"], row["slug"])
+        if revoked:
+            raise ApiError(403, "revoked_key", "la clave de ese artifact fue revocada")
+        if not hmac.compare_digest(self._state_key(row["owner"], row["slug"], epoch), key):
+            raise ApiError(401, "bad_key", "clave de artifact invalida")
+        # limite propio: las escrituras por clave no pasan por el cupo de un token
+        self.check_attempts("st:" + key[:32], limit=self.cfg["state_writes_per_min"], window=60)
+        return row
+
+    def reveal_key(self, owner, slug):
+        """La clave de estado de un artifact, para quien firma el token (nunca en un log)."""
+        row = self.artifact_of(owner, slug)
+        epoch, revoked = self.key_epoch(row["owner"], row["slug"])
+        return {"owner": row["owner"], "slug": row["slug"], "epoch": epoch, "revoked": revoked,
+                "key": None if revoked else self._state_key(row["owner"], row["slug"], epoch),
+                "state_url": "%s/api/v1/state/%s/%s" % (
+                    (self.cfg.get("base_url") or "").rstrip("/"), row["owner"], row["slug"])}
+
+    def get_state(self, owner, slug):
+        p = self._state_path(owner, slug)
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read(self.cfg["state_max_bytes"] + 1)
+
+    def put_state(self, owner, slug, raw, ip=None, via="token"):
+        if len(raw) > self.cfg["state_max_bytes"]:
+            raise ApiError(413, "too_large", "el estado supera %d bytes" % self.cfg["state_max_bytes"])
+        if not raw.strip():
+            raise ApiError(400, "empty", "el estado esta vacio")
+        try:
+            json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise ApiError(400, "bad_json", "el estado tiene que ser JSON valido")
+        p = self._state_path(owner, slug)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        self._atomic_write(p, raw)
+        self.log("state", owner, None, slug, len(raw), ip, "por %s" % via)
+        return len(raw)
+
+    def delete_state(self, owner, slug, ip=None):
+        p = self._state_path(owner, slug)
+        if not os.path.exists(p):
+            raise ApiError(404, "not_found", "ese artifact no tiene estado guardado")
+        os.remove(p)
+        self.log("state-rm", owner, None, slug, None, ip, None)
+        return True
+
     # ---------- leer / borrar ----------
     def list_artifacts(self, ctx, all_users=False, only_user=None):
         q = ("SELECT a.slug, a.title, a.version, a.sha256, a.bytes, a.created_at, a.updated_at,"
@@ -540,6 +799,8 @@ class Hub:
             is_app = os.path.isdir(os.path.join(self.data, "a", r["owner"], r["slug"]))
             r["kind"] = "app" if is_app else "page"
             r["url"] = self.url_for(r["owner"], r["slug"] + ("/" if is_app else ".html"))
+            r["thumb_url"] = self.thumb_url(r["owner"], r["slug"])
+            r["has_state"] = os.path.exists(self._state_path(r["owner"], r["slug"]))
         return rows
 
     def delete_artifact(self, ctx, name, ip=None):
@@ -574,6 +835,14 @@ class Hub:
                 if f.startswith(slug + "-v"):
                     os.remove(os.path.join(vdir, f))
                     removed += 1
+        # La vista previa y el estado se van con el artifact: si no, quedan huerfanos y el
+        # slug no se puede reusar limpio.
+        for extra in (os.path.join(d, slug + ".preview.png"), self._state_path(row["owner"], slug)):
+            if os.path.exists(extra):
+                os.remove(extra)
+                removed += 1
+        with self.db() as c:
+            c.execute("DELETE FROM artifact_keys WHERE owner=? AND slug=?", (row["owner"], slug))
         self.log("delete", ctx["name"], ctx["prefix"], slug, None, ip, "%d archivo(s)" % removed)
         return {"slug": slug, "removed_files": removed}
 
@@ -672,6 +941,22 @@ class Handler(BaseHTTPRequestHandler):
         if method != "HEAD" and body:
             self.wfile.write(body)
 
+    def _state_with_key(self, method, owner, slug, key, ip):
+        """Lectura y escritura de estado con la clave del artifact. Sin token."""
+        hub = self.hub
+        try:
+            row = hub.check_artifact_key(owner, slug, key)
+            if method in ("GET", "HEAD"):
+                raw = hub.get_state(row["owner"], row["slug"])
+                return self._send(200, raw if raw is not None else b"{}", "application/json")
+            if method == "PUT":
+                raw = self._body()
+                n = hub.put_state(row["owner"], row["slug"], raw, ip, via="clave")
+                return self._send(200, {"ok": True, "bytes": n})
+            raise ApiError(405, "method_not_allowed", "el estado se lee con GET y se escribe con PUT")
+        except ApiError as e:
+            self._err(e)
+
     def _handle(self, method):
         hub = self.hub
         ip = self.headers.get("X-Forwarded-For", self.client_address[0])
@@ -699,6 +984,12 @@ class Handler(BaseHTTPRequestHandler):
                                         "login_url": "https://%s/e/%s" % (base,
                                                     hub_web.make_login_code(hub, uid))})
 
+            # ESTADO por CLAVE DE ARTIFACT. La credencial es la clave que el hub le inyecto a
+            # la pagina, no el token de nadie: por eso va ANTES de authenticate.
+            art_key = self.headers.get("X-Artifact-Key")
+            if art_key and len(rest) == 3 and rest[0] == "state":
+                return self._state_with_key(method, rest[1], rest[2], art_key, ip)
+
             ctx = hub.authenticate(self.headers.get("Authorization"))
 
             # primero QUE ruta es, despues QUE metodo: una ruta inexistente es 404,
@@ -715,6 +1006,10 @@ class Handler(BaseHTTPRequestHandler):
                 route = "one"
             elif len(rest) == 2 and rest[0] == "apps":
                 route = "app"
+            elif len(rest) == 3 and rest[0] == "artifacts" and rest[2] in ("thumb", "key"):
+                route = rest[2]
+            elif len(rest) == 3 and rest[0] == "state":
+                route = "state"
             else:
                 raise ApiError(404, "not_found", "ruta desconocida")
 
@@ -760,7 +1055,55 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._body()
                 r = hub.deploy_app(ctx, rest[1], body, ip)
                 return self._send(200 if r["unchanged"] else 201,
-                                  {"ok": True, "url": hub.url_for(ctx["name"], r["slug"] + "/"), **r})
+                                  {"ok": True, "url": hub.url_for(ctx["name"], r["slug"] + "/"),
+                                   "thumb_url": hub.thumb_url(ctx["name"], r["slug"]), **r})
+
+            if route == "thumb":
+                slug = rest[1]
+                if method == "PUT":
+                    ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if ctype != "image/png":
+                        raise ApiError(415, "bad_type",
+                                       "la vista previa se sube como image/png (recibi '%s')" % (ctype or "vacio"))
+                    return self._send(201, {"ok": True, **hub.put_thumb(ctx, slug, self._body(), ip)})
+                if method == "DELETE":
+                    return self._send(200, {"ok": True, **hub.delete_thumb(ctx, slug, ip)})
+                raise ApiError(405, "method_not_allowed", "la vista previa se sube con PUT y se borra con DELETE")
+
+            if route == "key":
+                row = hub.mine_of(ctx, rest[1])
+                if method == "GET":
+                    return self._send(200, {"ok": True, **hub.reveal_key(row["owner"], row["slug"])})
+                if method == "POST":
+                    epoch = hub.rotate_key(row["owner"], row["slug"])
+                    return self._send(200, {"ok": True, "slug": row["slug"], "epoch": epoch,
+                                            "note": "la pagina ya servida dejo de poder; republica para que tenga la clave nueva"})
+                if method == "DELETE":
+                    off = (q.get("on", ["0"])[0] not in ("1", "true", "yes"))
+                    hub.revoke_key(row["owner"], row["slug"], off=off)
+                    return self._send(200, {"ok": True, "slug": row["slug"], "revoked": off,
+                                            "note": "apagado: la proxima publicacion no inyecta runtime"})
+                raise ApiError(405, "method_not_allowed",
+                               "la clave se lee con GET, se rota con POST y se apaga con DELETE")
+
+            # El estado siempre responde el DOCUMENTO (vacio si no hay nada), para que una
+            # pagina y el CLI lean lo mismo. PUT devuelve el acuse, no el documento.
+            if route == "state":
+                row = hub.artifact_of(rest[1], rest[2])
+                if not ctx["is_admin"] and row["owner"] != ctx["name"]:
+                    raise ApiError(403, "not_owner", "ese artifact no es tuyo")
+                if method in ("GET", "HEAD"):
+                    raw = hub.get_state(row["owner"], row["slug"])
+                    return self._send(200, raw if raw is not None else b"{}", "application/json")
+                if method == "PUT":
+                    raw = self._body()
+                    n = hub.put_state(row["owner"], row["slug"], raw, ip, via="token")
+                    return self._send(200, {"ok": True, "bytes": n})
+                if method == "DELETE":
+                    hub.delete_state(row["owner"], row["slug"], ip)
+                    return self._send(200, {"ok": True, "removed": True})
+                raise ApiError(405, "method_not_allowed",
+                               "el estado se lee con GET, se escribe con PUT y se borra con DELETE")
 
             if route == "one":
                 if method == "PUT":
@@ -778,6 +1121,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200 if r["unchanged"] else 201,
                                       {"ok": True, "url": hub.url_for(ctx["name"], r["name"]),
                                        "snapshot_url": hub.url_for(ctx["name"], r["snapshot"]) if r.get("snapshot") else None,
+                                       "thumb_url": hub.thumb_url(ctx["name"], r["slug"]),
                                        **r})
                 if method == "DELETE":
                     return self._send(200, {"ok": True, **hub.delete_artifact(ctx, rest[1], ip)})

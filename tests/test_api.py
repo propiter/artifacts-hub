@@ -87,6 +87,18 @@ class Base(unittest.TestCase):
     def pub(self, token, slug, body=HTML, **kw):
         return self.req("PUT", "/api/v1/artifacts/" + slug, token=token, data=body, **kw)
 
+    def read(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def assertIntact(self, served, original):
+        """El cuerpo del autor queda ENTERO: lo unico que agrega el hub va dentro del <head>,
+        asi que el prefijo hasta el <head> y todo lo que sigue tienen que estar tal cual."""
+        cut = original.lower().index(b"<head")
+        cut = original.index(b">", cut) + 1
+        self.assertTrue(served.startswith(original[:cut]), "cambio el principio")
+        self.assertTrue(served.endswith(original[cut:]), "cambio algo despues del <head>")
+
 
 class TestSaludYAuth(Base):
     def test_healthz_sin_token(self):
@@ -140,10 +152,13 @@ class TestPublicar(Base):
         self.assertEqual(s, 201, b)
         self.assertEqual(b["version"], 1)
         self.assertEqual(b["url"], "https://artifacts.test/a/ana/propuesta.html")
-        self.assertEqual(b["bytes"], len(HTML))
         f = os.path.join(self.tmp, "a", "ana", "propuesta.html")
         self.assertTrue(os.path.exists(f))
-        self.assertEqual(open(f, "rb").read(), HTML)
+        served = open(f, "rb").read()
+        # `bytes` es lo que se SIRVE: el cuerpo del autor mas los metadatos que agrega el hub.
+        self.assertEqual(b["bytes"], len(served))
+        self.assertTrue(b["bytes"] > len(HTML))
+        self.assertIntact(served, HTML)
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "a", "ana", "propuesta-v1.html")))
 
     def test_mismo_contenido_no_crea_version(self):
@@ -160,8 +175,11 @@ class TestPublicar(Base):
         self.assertEqual(b["version"], 2)
         self.assertEqual(b["snapshot"], "propuesta-v2.html")
         d = os.path.join(self.tmp, "a", "ana")
-        self.assertEqual(open(os.path.join(d, "propuesta.html"), "rb").read(), HTML2)   # canonica = ultima
-        self.assertEqual(open(os.path.join(d, "propuesta-v1.html"), "rb").read(), HTML)  # v1 inmutable
+        canon = open(os.path.join(d, "propuesta.html"), "rb").read()
+        v1 = open(os.path.join(d, "propuesta-v1.html"), "rb").read()
+        self.assertIn(b"<h1>v2</h1>", canon)      # canonica = ultima
+        self.assertIn(b"<h1>hola</h1>", v1)       # v1 inmutable
+        self.assertNotIn(b"<h1>v2</h1>", v1)
 
     def test_slug_invalido(self):
         for bad in ["Mayuscula", "con espacio", "-empieza-guion", "ñandu", "a" * 70, "../../etc/passwd", "a/b"]:
@@ -226,8 +244,12 @@ class TestPublicar(Base):
         self.pub(self.tok_beto, "informe", body=HTML2)
         a = open(os.path.join(self.tmp, "a", "ana", "informe.html"), "rb").read()
         b_ = open(os.path.join(self.tmp, "a", "beto", "informe.html"), "rb").read()
-        self.assertEqual(a, HTML)
-        self.assertEqual(b_, HTML2)
+        self.assertIntact(a, HTML)
+        self.assertIntact(b_, HTML2)
+        # Cada uno con SU url en la vista previa: el mismo slug no los mezcla.
+        self.assertIn(b"/a/ana/informe.html", a)
+        self.assertIn(b"/a/beto/informe.html", b_)
+        self.assertNotEqual(a, b_)
 
 
 def bundle(files, symlink=None):
@@ -842,6 +864,314 @@ class TestWeb(Base):
         csp = h.get("Content-Security-Policy", "")
         self.assertIn("default-src 'none'", csp)
         self.assertIn("frame-src https:", csp)
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64          # cabecera PNG valida + relleno
+
+
+class TestVistaPrevia(Base):
+    """El og:* que hace que el link se vea bien AL PEGARLO, en cualquier chat."""
+
+    def served(self, owner, name):
+        with open(os.path.join(self.tmp, "a", owner, name), "rb") as f:
+            return f.read()
+
+    def test_el_head_lleva_los_metadatos_y_el_contenido_del_autor_no_se_toca(self):
+        s, b = self.pub(self.tok_ana, "propuesta")
+        self.assertEqual(s, 201, b)
+        h = self.served("ana", "propuesta.html")
+        self.assertIntact(h, HTML)                        # el cuerpo del autor, intacto
+        self.assertIn(b'property="og:title" content="Propuesta"', h)
+        self.assertIn(b'property="og:url" content="https://artifacts.test/a/ana/propuesta.html"', h)
+        self.assertIn(b'property="og:type" content="website"', h)
+        self.assertIn(b'property="og:site_name" content="artifacts.test"', h)
+        self.assertIn(b"artifact-craft:meta v1", h)       # se puede reconocer
+
+    def test_lo_que_declara_el_autor_gana(self):
+        body = (b"<!doctype html><html><head><title>T</title>"
+                b'<meta property="og:image" content="https://mia.com/foto.png">'
+                b"</head><body>x</body></html>")
+        self.pub(self.tok_ana, "con-su-imagen", body=body)
+        h = self.served("ana", "con-su-imagen.html")
+        self.assertIn(b"https://mia.com/foto.png", h)
+        self.assertNotIn(b"preview.png", h)               # no le pisamos la suya
+
+    def test_sin_head_no_se_toca_nada(self):
+        body = b"<div>fragmento suelto</div>"
+        self.pub(self.tok_ana, "fragmento", body=body)
+        self.assertEqual(self.served("ana", "fragmento.html"), body)
+
+    def test_la_descripcion_sale_del_meta_del_autor(self):
+        body = (b"<!doctype html><html><head><title>T</title>"
+                b'<meta name="description" content="Un resumen corto"></head><body>x</body></html>')
+        self.pub(self.tok_ana, "con-desc", body=body)
+        self.assertIn(b'property="og:description" content="Un resumen corto"',
+                      self.served("ana", "con-desc.html"))
+
+    def test_sin_descripcion_no_se_inventa_una(self):
+        self.pub(self.tok_ana, "propuesta")
+        self.assertNotIn(b"og:description", self.served("ana", "propuesta.html"))
+
+    def test_republicar_lo_mismo_sigue_siendo_un_no_op(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.pub(self.tok_ana, "propuesta")
+        self.assertEqual(s, 200)
+        self.assertTrue(b["unchanged"])
+        self.assertEqual(b["version"], 1)
+
+    def test_el_snapshot_inmutable_tambien_lleva_los_metadatos(self):
+        self.pub(self.tok_ana, "propuesta")
+        self.assertIn(b"og:title", self.served("ana", "propuesta-v1.html"))
+
+    def test_una_app_tambien(self):
+        s, b = self.req("PUT", "/api/v1/apps/tablero", token=self.tok_ana,
+                        data=bundle(APP_FILES), ctype="application/gzip")
+        self.assertEqual(s, 201, b)
+        idx = self.read(os.path.join(self.tmp, "a", "ana", "tablero", "index.html"))
+        self.assertIn(b"og:title", idx)
+        self.assertIn(b"/a/ana/tablero/", idx)
+        # y el resto de la app queda como vino
+        self.assertEqual(self.read(os.path.join(self.tmp, "a", "ana", "tablero", "app.js")),
+                         b"console.log('hola');")
+
+
+class TestMiniatura(Base):
+    def test_subir_una_vista_previa(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("PUT", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana,
+                        data=PNG, ctype="image/png")
+        self.assertEqual(s, 201, b)
+        self.assertTrue(b["thumb_url"].endswith("/a/ana/propuesta.preview.png"))
+        self.assertEqual(open(os.path.join(self.tmp, "a", "ana", "propuesta.preview.png"), "rb").read(), PNG)
+
+    def test_entra_como_og_image_en_la_publicacion_siguiente(self):
+        self.req("PUT", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana,
+                 data=PNG, ctype="image/png")
+        self.pub(self.tok_ana, "propuesta")
+        h = open(os.path.join(self.tmp, "a", "ana", "propuesta.html"), "rb").read()
+        self.assertIn(b'property="og:image" content="https://artifacts.test/a/ana/propuesta.preview.png"', h)
+        self.assertIn(b'property="og:image:width" content="1200"', h)
+        self.assertIn(b'name="twitter:card" content="summary_large_image"', h)
+
+    def test_tiene_que_ser_un_png_de_verdad(self):
+        s, b = self.req("PUT", "/api/v1/artifacts/x/thumb", token=self.tok_ana,
+                        data=b"no soy un png", ctype="image/png")
+        self.assertEqual(s, 415)
+        self.assertEqual(b["error"], "bad_thumb")
+
+    def test_content_type_equivocado(self):
+        s, b = self.req("PUT", "/api/v1/artifacts/x/thumb", token=self.tok_ana,
+                        data=PNG, ctype="text/html")
+        self.assertEqual(s, 415)
+
+    def test_demasiado_grande(self):
+        big = PNG + b"\x00" * int(self.cfg["thumb_max_bytes"])
+        s, b = self.req("PUT", "/api/v1/artifacts/x/thumb", token=self.tok_ana,
+                        data=big, ctype="image/png")
+        self.assertEqual(s, 413)
+
+    def test_borrar(self):
+        self.req("PUT", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana, data=PNG, ctype="image/png")
+        s, b = self.req("DELETE", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana)
+        self.assertEqual(s, 200, b)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", "ana", "propuesta.preview.png")))
+
+    def test_la_lista_la_informa(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("GET", "/api/v1/artifacts", token=self.tok_ana)
+        self.assertIsNone(b["artifacts"][0]["thumb_url"])
+        self.req("PUT", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana, data=PNG, ctype="image/png")
+        s, b = self.req("GET", "/api/v1/artifacts", token=self.tok_ana)
+        self.assertTrue(b["artifacts"][0]["thumb_url"].endswith(".preview.png"))
+
+
+class TestEstado(Base):
+    """El artifact que DEVUELVE algo. La credencial es una clave POR ARTIFACT que el hub le
+    inyecta a la pagina; nunca es el token de la persona."""
+
+    def key_of(self, slug, token=None):
+        s, b = self.req("GET", "/api/v1/artifacts/%s/key" % slug, token=token or self.tok_ana)
+        self.assertEqual(s, 200, b)
+        return b
+
+    def put_with_key(self, owner, slug, key, data):
+        return self.req("PUT", "/api/v1/state/%s/%s" % (owner, slug), data=data,
+                        ctype="application/json", headers={"X-Artifact-Key": key})
+
+    def get_with_key(self, owner, slug, key):
+        return self.req("GET", "/api/v1/state/%s/%s" % (owner, slug), ctype=None,
+                        headers={"X-Artifact-Key": key})
+
+    def test_la_clave_queda_inyectada_y_nunca_es_el_token(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")
+        h = open(os.path.join(self.tmp, "a", "ana", "propuesta.html"), "rb").read()
+        self.assertIn(b"window.ARTIFACT=", h)
+        self.assertIn(b"artifact-craft:runtime v1", h)
+        self.assertIn(k["key"].encode(), h)
+        self.assertNotIn(self.tok_ana.encode(), h)          # el token NUNCA entra a la pagina
+        self.assertTrue(k["key"].startswith("art_"))
+
+    def test_ida_y_vuelta_con_la_clave(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        s, b = self.get_with_key("ana", "propuesta", k)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b, {})                             # todavia no hay estado
+        s, b = self.put_with_key("ana", "propuesta", k, b'{"aprobado":["a","b"]}')
+        self.assertEqual(s, 200, b)
+        s, b = self.get_with_key("ana", "propuesta", k)
+        self.assertEqual(s, 200)
+        self.assertEqual(b, {"aprobado": ["a", "b"]})
+
+    def test_el_estado_no_se_puede_pedir_por_http_directo(self):
+        """Vive bajo un directorio con punto justo para que nginx lo niegue."""
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        self.put_with_key("ana", "propuesta", k, b'{"secreto":1}')
+        d = os.path.join(self.tmp, "a", "ana", ".state")
+        self.assertTrue(os.path.exists(os.path.join(d, "propuesta.json")))
+        # lo que nginx niega es el segmento que empieza con punto (location ~ /[.] { deny all; })
+        self.assertIn(os.sep + ".state" + os.sep, os.path.join(d, "propuesta.json"))
+
+    def test_la_clave_de_uno_no_sirve_en_el_artifact_de_otro(self):
+        self.pub(self.tok_ana, "propuesta")
+        self.pub(self.tok_beto, "propuesta")
+        k_ana = self.key_of("propuesta")["key"]
+        s, b = self.put_with_key("beto", "propuesta", k_ana, b'{"x":1}')
+        self.assertEqual(s, 401)
+
+    def test_clave_inventada(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.put_with_key("ana", "propuesta", "art_" + "0" * 40, b'{"x":1}')
+        self.assertEqual(s, 401)
+
+    def test_sin_clave_ni_token(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("PUT", "/api/v1/state/ana/propuesta", data=b'{"x":1}',
+                        ctype="application/json")
+        self.assertEqual(s, 401)
+
+    def test_rotar_mata_la_vieja_y_la_nueva_sirve(self):
+        self.pub(self.tok_ana, "propuesta")
+        vieja = self.key_of("propuesta")["key"]
+        s, b = self.req("POST", "/api/v1/artifacts/propuesta/key", token=self.tok_ana)
+        self.assertEqual(s, 200, b)
+        s, b = self.put_with_key("ana", "propuesta", vieja, b'{"x":1}')
+        self.assertEqual(s, 401)
+        self.pub(self.tok_ana, "propuesta", body=HTML2)     # republicar inyecta la nueva
+        nueva = self.key_of("propuesta")["key"]
+        self.assertNotEqual(vieja, nueva)
+        s, b = self.put_with_key("ana", "propuesta", nueva, b'{"x":2}')
+        self.assertEqual(s, 200, b)
+
+    def test_apagar_el_estado(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        s, b = self.req("DELETE", "/api/v1/artifacts/propuesta/key", token=self.tok_ana)
+        self.assertEqual(s, 200, b)
+        s, b = self.put_with_key("ana", "propuesta", k, b'{"x":1}')
+        self.assertEqual(s, 403)
+        self.assertEqual(b["error"], "revoked_key")
+        # y al republicar la pagina ya no lleva runtime
+        self.pub(self.tok_ana, "propuesta", body=HTML2)
+        h = open(os.path.join(self.tmp, "a", "ana", "propuesta.html"), "rb").read()
+        self.assertNotIn(b"window.ARTIFACT=", h)
+
+    def test_json_invalido(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        s, b = self.put_with_key("ana", "propuesta", k, b"no soy json")
+        self.assertEqual(s, 400)
+        self.assertEqual(b["error"], "bad_json")
+
+    def test_vacio(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        s, b = self.put_with_key("ana", "propuesta", k, b"")
+        self.assertEqual(s, 400)
+
+    def test_demasiado_grande(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        grande = b'{"x":"' + b"a" * int(self.cfg["state_max_bytes"]) + b'"}'
+        s, b = self.put_with_key("ana", "propuesta", k, grande)
+        self.assertEqual(s, 413)
+
+    def test_con_token_el_dueno_lee_y_escribe(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("PUT", "/api/v1/state/ana/propuesta", token=self.tok_ana,
+                        data=b'{"v":1}', ctype="application/json")
+        self.assertEqual(s, 200, b)
+        s, b = self.req("GET", "/api/v1/state/ana/propuesta", token=self.tok_ana, ctype=None)
+        self.assertEqual(s, 200)
+        self.assertEqual(b, {"v": 1})
+
+    def test_con_token_ajeno_no(self):
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("PUT", "/api/v1/state/ana/propuesta", token=self.tok_beto,
+                        data=b'{"v":1}', ctype="application/json")
+        self.assertEqual(s, 403)
+        s, b = self.req("GET", "/api/v1/state/ana/propuesta", token=self.tok_beto, ctype=None)
+        self.assertEqual(s, 403)
+
+    def test_borrar_el_estado(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        self.put_with_key("ana", "propuesta", k, b'{"x":1}')
+        s, b = self.req("DELETE", "/api/v1/state/ana/propuesta", token=self.tok_ana)
+        self.assertEqual(s, 200, b)
+        s, b = self.get_with_key("ana", "propuesta", k)
+        self.assertEqual(b, {})
+
+    def test_borrar_el_artifact_se_lleva_miniatura_estado_y_clave(self):
+        self.pub(self.tok_ana, "propuesta")
+        self.req("PUT", "/api/v1/artifacts/propuesta/thumb", token=self.tok_ana, data=PNG, ctype="image/png")
+        k = self.key_of("propuesta")["key"]
+        self.put_with_key("ana", "propuesta", k, b'{"x":1}')
+        d = os.path.join(self.tmp, "a", "ana")
+        self.assertTrue(os.path.exists(os.path.join(d, "propuesta.preview.png")))
+        self.assertTrue(os.path.exists(os.path.join(d, ".state", "propuesta.json")))
+        s, b = self.req("DELETE", "/api/v1/artifacts/propuesta", token=self.tok_ana)
+        self.assertEqual(s, 200, b)
+        self.assertFalse(os.path.exists(os.path.join(d, "propuesta.preview.png")))
+        self.assertFalse(os.path.exists(os.path.join(d, ".state", "propuesta.json")))
+        # El slug borrado NO se reusa, a proposito: asi un link viejo no revive con otro
+        # contenido. Y su clave se fue con el artifact.
+        s, b = self.pub(self.tok_ana, "propuesta")
+        self.assertEqual(s, 409)
+        self.assertEqual(b["error"], "deleted_slug")
+        import sqlite3
+        c = sqlite3.connect(self.cfg["db_path"])
+        n = c.execute("SELECT COUNT(*) FROM artifact_keys WHERE owner='ana' AND slug='propuesta'").fetchone()[0]
+        c.close()
+        self.assertEqual(n, 0)
+
+    def test_la_base_no_guarda_material_de_la_clave(self):
+        """La clave se DERIVA del secreto del servidor: en la base no queda ni ella ni su hash."""
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        import glob
+        import sqlite3
+        for f in glob.glob(self.cfg["db_path"] + "*"):
+            self.assertNotIn(k.encode(), open(f, "rb").read(), f)
+        c = sqlite3.connect(self.cfg["db_path"])
+        n = c.execute("SELECT COUNT(*) FROM artifact_keys").fetchone()[0]
+        c.close()
+        self.assertEqual(n, 0)          # ni siquiera hace falta una fila
+
+    def test_rotar_deja_el_contador_y_nada_mas(self):
+        self.pub(self.tok_ana, "propuesta")
+        k = self.key_of("propuesta")["key"]
+        self.req("POST", "/api/v1/artifacts/propuesta/key", token=self.tok_ana)
+        import glob
+        import sqlite3
+        for f in glob.glob(self.cfg["db_path"] + "*"):
+            self.assertNotIn(k.encode(), open(f, "rb").read(), f)
+        c = sqlite3.connect(self.cfg["db_path"])
+        rows = c.execute("SELECT owner, slug, epoch, revoked_at FROM artifact_keys").fetchall()
+        c.close()
+        self.assertEqual(rows, [("ana", "propuesta", 1, None)])
 
 
 if __name__ == "__main__":
