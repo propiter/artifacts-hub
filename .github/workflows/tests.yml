@@ -37,6 +37,7 @@ jobs:
           APP=ci-check-artifactshub-000000
           ENVID=0000000000000000000000000
           HOST=example.invalid
+          APP_HOST=app.example.invalid
           IMAGE=registry.example.invalid/ns/artifacts-hub:0.0.0
           ENV
           python3 deploy/gen-deploy-sql.py
@@ -45,6 +46,16 @@ jobs:
           grep -q "registry.example.invalid/ns/artifacts-hub:0.0.0" "$sql" || { echo "no puso la imagen publicada"; exit 1; }
           grep -q "dokploy-network" "$sql" || { echo "no inyecto dokploy-network"; exit 1; }
           grep -q "build:" "$sql" && { echo "quedo un build: en el compose desplegable"; exit 1; }
+          # Lo que hace que el compose ARRANQUE en Dokploy, no solo que se vea valido. Habia dos
+          # caminos (con y sin PyYAML) y el de texto no hacia nada de esto, en silencio: aplicar
+          # su salida dejaba a nginx sin su conf (Docker crea un DIRECTORIO) y a la galeria sin
+          # su hostname. Sin PyYAML a proposito, que es como corre en una maquina cualquiera.
+          python3 -c "import yaml" 2>/dev/null && { echo "este job tiene que correr SIN PyYAML"; exit 1; }
+          grep -q -- "- ../files/store/default.conf:/etc/nginx/conf.d/default.conf:ro" "$sql" || { echo "el conf de nginx no apunta a ../files/"; exit 1; }
+          grep -q -- "- ../files/store/www:/www:ro" "$sql" || { echo "las semillas no apuntan a ../files/"; exit 1; }
+          grep -qE -- "^\s+- \./" "$sql" && { echo "quedo un bind relativo ./ (en Dokploy crea un directorio)"; exit 1; }
+          grep -q "HUB_APP_HOST: app.example.invalid" "$sql" || { echo "falta HUB_APP_HOST"; exit 1; }
+          grep -q "HUB_BASE_URL: https://example.invalid" "$sql" || { echo "HUB_BASE_URL no es la URL publica"; exit 1; }
           echo "generador OK"
 
   compose:

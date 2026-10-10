@@ -116,77 +116,53 @@ FROM mount m JOIN compose c ON c."composeId" = m."composeId" WHERE c."appName" =
 def build_deploy_yaml(image, host, app_host=""):
     """Devuelve el compose que se despliega: con la imagen publicada y en dokploy-network.
 
-    El repo NO puede declarar `dokploy-network` (es externa y solo existe en el servidor),
-    asi que la inyectamos aca. Con PyYAML si esta; si no, insercion por texto CON asserts,
-    para que falle ruidosamente en vez de generar un compose roto.
+    UN solo camino, de texto y con la stdlib. Antes habia dos —con PyYAML y sin— y el de
+    texto no reescribia los binds ni ponia HUB_APP_HOST: segun la maquina donde corria, el
+    mismo generador daba un compose que arrancaba o uno que tiraba produccion, sin avisar.
+    Cada transformacion tiene su assert: si docker-compose.yml cambia de forma, esto FALLA
+    en vez de generar algo roto.
     """
-    texto = (ROOT / "docker-compose.yml").read_text()
+    import re as _re
+    salida = (ROOT / "docker-compose.yml").read_text()
 
-    try:
-        import yaml
-    except ImportError:
-        yaml = None
+    def una_vez(patron, repl, texto, que):
+        nuevo, n = _re.subn(patron, repl, texto, flags=_re.M)
+        assert n == 1, "esperaba 1 %s y hubo %d (¿cambio docker-compose.yml?)" % (que, n)
+        return nuevo
 
-    if yaml is not None:
-        doc = yaml.safe_load(texto)
-        svc = doc["services"]
-        # la imagen ya publicada reemplaza el build
-        svc["api"].pop("build", None)
-        svc["api"]["image"] = image
-        # el servicio que recibe el dominio TIENE que estar en dokploy-network
-        store_nets = svc["store"].get("networks") or []
-        if isinstance(store_nets, list) and "dokploy-network" not in store_nets:
-            store_nets.append("dokploy-network")
-        svc["store"]["networks"] = store_nets
-        doc.setdefault("networks", {})["dokploy-network"] = {"external": True}
+    # la imagen ya publicada reemplaza el build: un compose 'raw' no puede construir
+    salida = una_vez(r"^    build: \./api\n", lambda m: "    image: %s\n" % image, salida, "build: ./api")
 
-        # HUB_BASE_URL tiene que ser la URL PUBLICA: de aca salen los links que se
-        # reparten. Con el default del compose de local devolvia
-        # http://127.0.0.1:18080/... — la URL del PC, que no le sirve a nadie.
-        entorno = svc["api"].setdefault("environment", {})
-        entorno["HUB_BASE_URL"] = "https://" + host
-        # el hostname de la app: separa la sesion del contenido de terceros
-        if app_host:
-            entorno["HUB_APP_HOST"] = app_host
+    # el servicio que recibe el dominio TIENE que estar en dokploy-network
+    salida = una_vez(r"^    networks: \[internal\]\n", "    networks: [internal, dokploy-network]\n",
+                     salida, "networks del store")
+    salida = una_vez(r"^networks:\n  internal:\n",
+                     "networks:\n  internal:\n  dokploy-network:\n    external: true\n",
+                     salida, "bloque networks")
 
-        # Los binds del repo son `./store/...` (relativo al repo). En Dokploy el compose
-        # corre desde `code/` y los archivos viven en `files/`: hay que prefijarlos con
-        # ../files/. Si no, Docker NO encuentra el origen y crea un DIRECTORIO con ese
-        # nombre: nginx no arranca y el contenedor queda en `Created`. Es la regla
-        # unica: `./X` -> `../files/X`, y deploy.sh sube el arbol igual.
-        for nombre, svc_def in doc["services"].items():
-            nuevos = []
-            for vol in svc_def.get("volumes") or []:
-                if isinstance(vol, str) and vol.startswith("./"):
-                    origen, resto = vol.split(":", 1)
-                    vol = "../files/" + origen[2:] + ":" + resto
-                nuevos.append(vol)
-            if nuevos:
-                svc_def["volumes"] = nuevos
-        salida = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False, width=120)
-    else:
-        salida = texto.replace("    build: ./api\n", "    image: %s\n" % image)
-        assert host in salida or "HUB_BASE_URL" in salida
-        salida = salida.replace("    networks: [internal]\n", "    networks: [internal, dokploy-network]\n")
-        # y la URL publica (el default del repo es el de local)
-        import re as _re
-        salida = _re.sub(r"(HUB_BASE_URL: ).*", r"\1https://" + host.replace("\\", "\\\\"), salida)
-        salida = salida.replace("networks:\n  internal:\n",
-                                "networks:\n  internal:\n  dokploy-network:\n    external: true\n")
-        assert "dokploy-network" in salida, "no pude inyectar dokploy-network (¿cambio el compose?)"
-        assert "    build: ./api\n" not in salida, "quedo un build: en el compose desplegable"
-        assert image in salida, "no pude poner la imagen publicada"
+    # HUB_BASE_URL tiene que ser la URL PUBLICA: de aca salen los links que se reparten.
+    # Con el default del compose de local devolvia http://127.0.0.1:18080/..., la URL del PC.
+    # Y al lado, el hostname de la app: separa la sesion del contenido de terceros.
+    extra = ("\n      HUB_APP_HOST: %s" % app_host) if app_host else ""
+    salida = una_vez(r"^(      HUB_BASE_URL: ).*$",
+                     lambda m: m.group(1) + "https://" + host + extra, salida, "HUB_BASE_URL")
 
-    if yaml is None:
-        # el dump de PyYAML no existe en este camino: el texto ya es valido
-        pass
-    # el compose desplegable no lleva el nombre de host del nginx: se reemplaza aca y en
-    # el default.conf que se sube a files/ (ver deploy.sh)
+    # Los binds del repo son `./store/...` (relativo al repo). En Dokploy el compose corre
+    # desde `code/` y los archivos viven en `files/`: sin el prefijo, Docker no encuentra el
+    # origen y crea un DIRECTORIO con ese nombre (nginx no arranca). Regla unica:
+    # `./X` -> `../files/X`, y deploy.sh sube el arbol igual.
+    salida, n = _re.subn(r"^(\s+- )\./", r"\1../files/", salida, flags=_re.M)
+    assert n >= 1, "no encontre binds ./ que reescribir (¿cambio docker-compose.yml?)"
+    assert not _re.search(r"^\s+- \./", salida, _re.M), "quedo un bind relativo ./"
+
+    assert "build:" not in salida, "quedo un build: en el compose desplegable"
+    assert image in salida, "no quedo la imagen publicada"
+
     cabecera = (
         "# GENERADO por deploy/gen-deploy-sql.py desde docker-compose.yml — no editar a mano.\n"
         "# Diferencias con el del repo: usa la imagen YA PUBLICADA (un compose 'raw' no puede\n"
-        "# construir: Dokploy regenera code/ y el contexto de build desaparece) y suma la\n"
-        "# red externa dokploy-network al servicio que recibe el dominio.\n"
+        "# construir: Dokploy regenera code/ y el contexto de build desaparece), suma la red\n"
+        "# externa dokploy-network, la URL publica, el hostname de la app, y los binds a ../files/.\n"
     )
     return cabecera + salida
 
