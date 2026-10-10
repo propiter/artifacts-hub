@@ -40,7 +40,12 @@ jobs:
           APP_HOST=app.example.invalid
           IMAGE=registry.example.invalid/ns/artifacts-hub:0.0.0
           ENV
+          # Un SQL de una version anterior del generador, con la imagen vieja adentro: si
+          # sobrevive, alguien lo aplica a mano y devuelve produccion a esa version.
+          echo "-- viejo" > deploy/ci-check-artifactshub-000000-update-compose.sql
           python3 deploy/gen-deploy-sql.py
+          [ ! -e deploy/ci-check-artifactshub-000000-update-compose.sql ] || { echo "sobrevivio un SQL viejo"; exit 1; }
+          [ "$(ls deploy/ci-check-artifactshub-000000-*.sql | wc -l)" = 4 ] || { echo "esperaba exactamente 4 SQL"; ls deploy/*.sql; exit 1; }
           sql=deploy/ci-check-artifactshub-000000-02-compose.sql
           test -s "$sql"
           grep -q "registry.example.invalid/ns/artifacts-hub:0.0.0" "$sql" || { echo "no puso la imagen publicada"; exit 1; }

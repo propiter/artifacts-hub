@@ -7,7 +7,9 @@ y no al del repo, y el stack local dejo de funcionar sin que nada avisara.
 
 Uso:  python3 deploy/gen-deploy-sql.py
 Lee:  deploy/deploy.env  +  docker-compose.yml  +  store/default.conf  +  store/www/*
-Escribe: deploy/<APP>-{02-compose,04-domain,05-mount}.sql
+Escribe: deploy/<APP>-{02-compose,03-update-compose,04-domain,05-mount}.sql
+         y borra cualquier otro deploy/<APP>-*.sql: lo que este generador ya no produce es
+         de una version anterior, con una imagen vieja adentro, y aplicarlo la restaura.
 """
 import pathlib
 import sys
@@ -235,6 +237,12 @@ def main():
         sys.exit("el compose desplegable quedo con una URL local: revisar HUB_BASE_URL")
     if ("https://" + host) not in yaml_texto:
         sys.exit("el compose desplegable no lleva la URL publica %s" % host)
+
+    producidos = {"%s-%s.sql" % (app, n) for n in ("02-compose", "03-update-compose", "04-domain", "05-mount")}
+    for viejo in HERE.glob("%s-*.sql" % app):
+        if viejo.name not in producidos:
+            viejo.unlink()
+            print("borrado (lo genero una version anterior):", viejo.name)
 
     print("generados para %s (imagen %s):" % (app, image))
     for s in sorted(HERE.glob("%s-*.sql" % app)):

@@ -44,6 +44,24 @@ bash deploy/deploy.sh files
 ./dk.sh <servidor> deploy <APP>
 ```
 
+## Actualizar un servicio que ya existe (imagen nueva o cambio en el compose)
+
+```bash
+# 0. respaldar la base FUERA del volumen (sqlite3 .backup en caliente, no un cp del archivo)
+# 1. construir y publicar la imagen con una etiqueta NUEVA (nunca pisar una publicada)
+# 2. subir esa etiqueta a IMAGE= en deploy/deploy.env y regenerar
+python3 deploy/gen-deploy-sql.py
+# 3. si cambio algo de store/ (conf de nginx, landing), subirlo y verificarlo hash contra hash
+bash deploy/deploy.sh files
+# 4. ensayar y aplicar el UPDATE del compose, y desplegar
+./dk.sh <servidor> dry <repo>/deploy/<APP>-03-update-compose.sql
+bash deploy/deploy.sh sql
+./dk.sh <servidor> deploy <APP>
+```
+
+Volver atrás es lo mismo con la etiqueta anterior en `IMAGE=`: la imagen vieja sigue en el
+registry y la migración del schema es aditiva (`CREATE TABLE IF NOT EXISTS`).
+
 ## Tres cosas que rompen el ruteo (nos costaron 502 en producción)
 
 1. **Un nombre de servicio genérico colisiona entre redes.** El contenedor que recibe el dominio

@@ -88,11 +88,6 @@ case "${1:-all}" in
   sql)   DK="${DK:-$HOME/.hermes/skills/claude-code-imports/dokploy/assets/dk.sh}"
          [ -x "$DK" ] || { echo "no encuentro dk.sh; pasalo en DK=/ruta/dk.sh"; exit 1; }
          "$DK" "$SERVER" sql "$HERE/${APP}-03-update-compose.sql" ;;
-
-  # CUIDADO: el generador escribe ${APP}-03-update-compose.sql. El archivo
-  # ${APP}-update-compose.sql es un LEFTOVER de una version anterior del generador y quedo con la
-  # imagen vieja adentro: aplicarlo devuelve la app a esa version. Por eso `sql` usa la ruta
-  # canonica y no la elige nadie a mano.
   all)   prep; files ;;
-  *) echo "uso: bash deploy/deploy.sh [files|build|push|prep|landing|all]"; exit 1 ;;
+  *) echo "uso: bash deploy/deploy.sh [files|build|push|prep|landing|sql|all]"; exit 1 ;;
 esac
