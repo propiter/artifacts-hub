@@ -6,7 +6,7 @@ RUN apk add --no-cache su-exec
 WORKDIR /app
 # *.py y no una lista: con la lista, un modulo nuevo (meta.py) pasaba todos los tests —corren
 # desde el fuente— y la imagen moria al arrancar con ModuleNotFoundError.
-COPY *.py ./
+COPY *.py runtime.js ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
  && adduser -D -u 10001 -h /app hub

@@ -16,7 +16,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # Sin dependencias: la suite corre con la stdlib. Nada que instalar.
+      # El runtime que se inyecta en las paginas se prueba ejecutandolo con Node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Sin dependencias: la suite corre con la stdlib (y node para el runtime). Nada que instalar.
       - name: Suite de tests
         run: python3 tests/test_api.py -v
 
@@ -104,6 +108,7 @@ jobs:
                    http://127.0.0.1:18090/api/v1/artifacts/imagen)
           [ "$code" = "201" ] || [ "$code" = "200" ] || { echo "publicar dio $code"; cat /tmp/r.json; docker logs hub; exit 1; }
           grep -q 'window.ARTIFACT=' "$D/a/ci/imagen.html" || { echo "la imagen no inyecta el runtime"; exit 1; }
+          grep -q 'A.save = async function' "$D/a/ci/imagen.html" || { echo "la imagen no lleva runtime.js"; exit 1; }
           echo "imagen OK"
 
   # La base vive en el MISMO volumen que nginx sirve como docroot. Sin una lista blanca, la

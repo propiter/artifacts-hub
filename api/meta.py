@@ -23,7 +23,27 @@ Lo que habilita:
 import re
 
 MARK = b"<!-- artifact-craft:meta v1 -->"
-RUNTIME_MARK = b"<!-- artifact-craft:runtime v1 -->"
+RUNTIME_MARK = b"<!-- artifact-craft:runtime v2 -->"
+
+
+def _load_runtime():
+    """runtime.js sin comentarios: va inline en CADA pagina, asi que lo que no ejecuta no viaja.
+
+    Solo se quitan bloques /* */ y lineas que son enteras un comentario //, nunca nada dentro
+    de una linea de codigo (ahi puede haber "//" en un string). Si el archivo falta, la imagen
+    esta mal armada y el hub NO arranca: mejor eso que paginas sin runtime en silencio.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent / "runtime.js").read_text(encoding="utf-8")
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    lines = [l.strip() for l in src.splitlines()]
+    out = "\n".join(l for l in lines if l and not l.startswith("//"))
+    if "</" in out or "<!--" in out:
+        raise RuntimeError("runtime.js no puede contener '</' ni '<!--': cerraria el <script>")
+    return out.encode("utf-8")
+
+
+RUNTIME_JS = _load_runtime()
 
 _HEAD_OPEN = re.compile(rb"<head\b[^>]*>", re.I)
 _HEAD_CLOSE = re.compile(rb"</head\s*>", re.I)
@@ -95,7 +115,7 @@ def inject(body, *, title=None, description=None, url=None, image=None,
         # La clave va aca a proposito: el artifact ES el portador del link, y la clave
         # solo alcanza a ESTE artifact. Nunca es el token de la persona.
         payload = ("window.ARTIFACT=" + _json(runtime) + ";").encode()
-        chunks.append(RUNTIME_MARK + b"\n<script>" + payload + b"</script>")
+        chunks.append(RUNTIME_MARK + b"\n<script>" + payload + b"\n" + RUNTIME_JS + b"</script>")
 
     if not chunks:
         return body

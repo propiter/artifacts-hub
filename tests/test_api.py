@@ -1007,7 +1007,7 @@ class TestEstado(Base):
         k = self.key_of("propuesta")
         h = open(os.path.join(self.tmp, "a", "ana", "propuesta.html"), "rb").read()
         self.assertIn(b"window.ARTIFACT=", h)
-        self.assertIn(b"artifact-craft:runtime v1", h)
+        self.assertIn(b"artifact-craft:runtime v2", h)
         self.assertIn(k["key"].encode(), h)
         self.assertNotIn(self.tok_ana.encode(), h)          # el token NUNCA entra a la pagina
         self.assertTrue(k["key"].startswith("art_"))
@@ -1363,6 +1363,46 @@ class TestCupoEstado(Base):
         time.sleep(0.05)
         hub.check_attempts("otra", limit=5, window=0.01, sweep_over=10)
         self.assertLessEqual(len([k for k in hub.attempts if k.startswith("prueba:")]), 0)
+
+
+class TestRuntime(Base):
+    """Las funciones que el hub le inyecta a cada pagina, ejecutadas DE VERDAD: Node corre el
+    runtime tal como se sirve, con visitantes aislados (como navegadores distintos) contra
+    este hub. Los escenarios estan en runtime_scenarios.mjs."""
+    overrides = {"state_reads_per_min": 10000, "state_writes_per_min": 10000,
+                 "state_writes_per_min_total": 10000}
+
+    def served_runtime(self):
+        self.pub(self.tok_ana, "juego")
+        h = self.read(os.path.join(self.tmp, "a", "ana", "juego.html"))
+        i = h.index(b"<!-- artifact-craft:runtime v2 -->")
+        start = h.index(b"<script>", i) + len(b"<script>")
+        return h[start:h.index(b"</script>", start)]
+
+    def test_el_runtime_viaja_en_la_pagina_sin_romper_el_script(self):
+        js = self.served_runtime()
+        self.assertIn(b"window.ARTIFACT=", js)
+        self.assertIn(b"A.save = async function", js)
+        self.assertNotIn(b"</", js)
+        self.assertNotIn(b"/*", js, "los comentarios no tienen que viajar en cada pagina")
+        self.assertLess(len(js), 12000)
+
+    def test_los_escenarios_corren_en_node(self):
+        node = shutil.which("node")
+        if not node:
+            if os.environ.get("CI"):
+                self.fail("el CI tiene que tener node para probar el runtime")
+            self.skipTest("sin node en esta maquina")
+        js = self.served_runtime()
+        f = os.path.join(self.tmp, "runtime-servido.js")
+        with open(f, "wb") as out:
+            out.write(js)
+        import subprocess
+        r = subprocess.run([node, os.path.join(ROOT, "tests", "runtime_scenarios.mjs"), f, self.base],
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, "\n" + r.stdout + r.stderr)
+        self.assertNotIn("FAIL", r.stdout)
+        self.assertGreaterEqual(r.stdout.count("ok   "), 17, r.stdout)
 
 
 if __name__ == "__main__":

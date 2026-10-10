@@ -693,7 +693,8 @@ class Hub:
         runtime = None
         if not revoked:
             runtime = {"api": (self.cfg.get("base_url") or "").rstrip("/"), "owner": owner,
-                       "slug": slug, "key": self._state_key(owner, slug, epoch)}
+                       "slug": slug, "key": self._state_key(owner, slug, epoch),
+                       "max": self.cfg["state_max_bytes"]}
         return hub_meta.inject(
             body,
             title=title,
