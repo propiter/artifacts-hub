@@ -89,3 +89,48 @@ jobs:
           [ "$code" = "201" ] || [ "$code" = "200" ] || { echo "publicar dio $code"; cat /tmp/r.json; docker logs hub; exit 1; }
           grep -q 'window.ARTIFACT=' "$D/a/ci/imagen.html" || { echo "la imagen no inyecta el runtime"; exit 1; }
           echo "imagen OK"
+
+  # La base vive en el MISMO volumen que nginx sirve como docroot. Sin una lista blanca, la
+  # raiz servia cualquier archivo del volumen: /hub.sqlite3 se bajaba con un GET (paso en
+  # produccion). Esto levanta el stack real —la imagen de la API y nginx con ESTE default.conf,
+  # compartiendo el volumen como en el servidor— y prueba lo que ve alguien de afuera.
+  docroot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fuera de lo declarado, la raiz no sirve nada
+        run: |
+          docker build -t hub:ci api/
+          docker network create hubnet
+          docker volume create hubdata
+          docker run -d --name api --network hubnet --network-alias artifactshub-api \
+            -e HUB_DATA=/data -e HUB_DB=/data/hub.sqlite3 -e HUB_BASE_URL=http://127.0.0.1:18091 \
+            -v hubdata:/data -v "$PWD/store/www:/www:ro" hub:ci
+          docker run -d --name store --network hubnet -p 18091:80 -v hubdata:/usr/share/nginx/html \
+            -v "$PWD/store/default.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.27-alpine
+          for i in $(seq 1 40); do curl -sf http://127.0.0.1:18091/healthz >/dev/null && break; sleep 0.5; done
+          docker exec -u hub api python3 admin.py user add ci >/dev/null
+          TOK=$(docker exec -u hub api python3 admin.py token add ci --label ci | grep -o 'wlart_[a-f0-9]*' | head -1)
+          printf '<!doctype html><html><head><title>Raiz</title></head><body>x</body></html>' > /tmp/p.html
+          curl -sf -X PUT -H "Authorization: Bearer $TOK" -H 'Content-Type: text/html' \
+               --data-binary @/tmp/p.html http://127.0.0.1:18091/api/v1/artifacts/raiz >/dev/null
+          docker exec api sh -c 'test -f /data/hub.sqlite3' || { echo "la base no esta donde la prueba supone"; exit 1; }
+          fail=0
+          want() {  # want <codigo-esperado> <ruta>
+            got=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18091$2")
+            if [ "$got" = "$1" ]; then echo "  ok   $got  $2"; else echo "  MAL  $got (esperaba $1)  $2"; fail=1; fi
+          }
+          echo "--- lo que NO se puede bajar ---"
+          want 404 /hub.sqlite3
+          want 404 /hub.sqlite3-wal
+          want 404 /hub.sqlite3-shm
+          want 404 /cualquier-archivo.txt
+          want 403 /a/ci/.state/raiz.json
+          echo "--- lo que SI se sirve ---"
+          want 200 /
+          want 200 /index.html
+          want 200 /healthz
+          want 200 /a/ci/raiz.html
+          want 401 /api/v1/artifacts
+          [ $fail = 0 ] || { docker logs store | tail -20; exit 1; }
+          echo "docroot OK"
