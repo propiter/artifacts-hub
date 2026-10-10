@@ -1174,5 +1174,111 @@ class TestEstado(Base):
         self.assertEqual(rows, [("ana", "propuesta", 1, None)])
 
 
+class TestEstadoConcurrente(Base):
+    """Dos que escriben a la vez no se pisan EN SILENCIO.
+
+    El ETag es el hash del contenido guardado: no hace falta guardar un contador. Quien lee
+    recibe el ETag; quien escribe lo devuelve en If-Match; si alguien escribio en el medio,
+    recibe 412 con el estado ACTUAL, para poder mezclar en vez de perder el trabajo del otro.
+    Sin If-Match se escribe como siempre: las paginas ya publicadas no se rompen.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pub(self.tok_ana, "propuesta")
+        s, b = self.req("GET", "/api/v1/artifacts/propuesta/key", token=self.tok_ana)
+        self.key = b["key"]
+        self.url = self.base + "/api/v1/state/ana/propuesta"
+
+    def raw(self, method, data=None, headers=None, token=None):
+        """Como req, pero devuelve tambien los HEADERS (el ETag vive ahi)."""
+        h = {"Content-Type": "application/json"}
+        if token:
+            h["Authorization"] = "Bearer " + token
+        else:
+            h["X-Artifact-Key"] = self.key
+        h.update(headers or {})
+        r = urllib.request.Request(self.url, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                body = resp.read()
+                return resp.status, dict(resp.headers), (json.loads(body) if body else {})
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            return e.code, dict(e.headers), (json.loads(body) if body else {})
+
+    def test_get_devuelve_etag_aun_sin_estado(self):
+        s, h, b = self.raw("GET")
+        self.assertEqual(s, 200)
+        self.assertEqual(b, {})
+        self.assertTrue(h.get("ETag", "").startswith('"'), h)
+
+    def test_put_devuelve_el_etag_nuevo_y_coincide_con_el_get(self):
+        s, h, b = self.raw("PUT", b'{"v":1}')
+        self.assertEqual(s, 200, b)
+        self.assertEqual(h.get("ETag"), b.get("etag"))
+        s2, h2, _ = self.raw("GET")
+        self.assertEqual(h2.get("ETag"), h.get("ETag"))
+
+    def test_if_match_al_dia_escribe(self):
+        _, h, _ = self.raw("GET")
+        s, _, b = self.raw("PUT", b'{"v":1}', {"If-Match": h["ETag"]})
+        self.assertEqual(s, 200, b)
+
+    def test_if_match_viejo_da_412_con_el_estado_actual(self):
+        _, h, _ = self.raw("GET")                       # A lee
+        self.raw("PUT", b'{"de":"beto"}')               # B escribe en el medio
+        s, h2, b = self.raw("PUT", b'{"de":"ana"}', {"If-Match": h["ETag"]})   # A escribe tarde
+        self.assertEqual(s, 412, b)
+        self.assertEqual(b["error"], "conflict")
+        self.assertEqual(b["state"], {"de": "beto"})    # lo que hay, para mezclar
+        self.assertEqual(b["etag"], h2.get("ETag"))     # y con que ETag reintentar
+        _, _, actual = self.raw("GET")
+        self.assertEqual(actual, {"de": "beto"})        # NO se piso
+
+    def test_sin_if_match_sigue_escribiendo_como_antes(self):
+        self.raw("PUT", b'{"v":1}')
+        s, _, b = self.raw("PUT", b'{"v":2}')
+        self.assertEqual(s, 200, b)
+
+    def test_el_dueno_con_token_tambien_respeta_if_match(self):
+        _, h, _ = self.raw("GET", token=self.tok_ana)
+        self.raw("PUT", b'{"de":"la-pagina"}')
+        s, _, b = self.raw("PUT", b'{"de":"el-agente"}', {"If-Match": h["ETag"]}, token=self.tok_ana)
+        self.assertEqual(s, 412, b)
+
+    def test_carrera_real_solo_uno_gana(self):
+        """Muchos escriben a la vez con el MISMO If-Match: exactamente uno tiene que ganar.
+        Sin un lock entre comparar y escribir, ganan varios y se pierden datos.
+
+        La lectura se demora a proposito: asi la ventana entre comparar y escribir es ancha y
+        el test FALLA de verdad si alguien quita el lock (verificado con una mutacion), en vez
+        de pasar por suerte porque las escrituras fueron rapidas."""
+        hub = Handler.hub
+        real_get = hub.get_state
+
+        def slow_get(owner, slug):
+            r = real_get(owner, slug)
+            time.sleep(0.02)
+            return r
+
+        hub.get_state = slow_get
+        _, h, _ = self.raw("GET")
+        etag = h["ETag"]
+        results = []
+
+        def writer(i):
+            s, _, _ = self.raw("PUT", ('{"w":%d}' % i).encode(), {"If-Match": etag})
+            results.append(s)
+
+        ts = [threading.Thread(target=writer, args=(i,)) for i in range(12)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(results.count(200), 1, results)
+        self.assertEqual(results.count(412), 11, results)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

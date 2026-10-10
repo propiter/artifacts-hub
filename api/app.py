@@ -186,9 +186,26 @@ def _safe_relpath(name):
 
 
 class ApiError(Exception):
-    def __init__(self, status, code, message):
+    def __init__(self, status, code, message, extra=None):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
+        # campos ademas de error/message que el cliente necesita para resolver (ej. un 412)
+        self.extra = extra or {}
+
+
+def state_etag(raw):
+    """ETag del estado = hash de lo GUARDADO. Sin estado cuenta como "{}", que es lo que se lee.
+
+    Al derivarse del contenido no hay contador que guardar ni que se desincronice: dos estados
+    iguales tienen el mismo ETag, y cualquier cambio lo cambia.
+    """
+    return '"%s"' % hashlib.sha256(raw if raw is not None else b"{}").hexdigest()[:24]
+
+
+def same_etag(a, b):
+    """Compara ETags como lo hace HTTP para If-Match: sin el prefijo debil W/ y sin espacios."""
+    norm = lambda s: (s or "").strip().removeprefix("W/")
+    return norm(a) == norm(b)
 
 
 def now():
@@ -219,6 +236,9 @@ class Hub:
         self.data = cfg["data_dir"]
         self.db_path = cfg["db_path"]
         self.lock = threading.Lock()
+        # Aparte del lock general: comparar el If-Match y escribir tiene que ser UNA operacion,
+        # o dos escritores con el mismo ETag ganan los dos y uno pierde lo suyo sin enterarse.
+        self.state_lock = threading.Lock()
         self.rate = {}
         self.attempts = {}
         os.makedirs(os.path.join(self.data, "a"), exist_ok=True)
@@ -757,7 +777,13 @@ class Hub:
         with open(p, "rb") as f:
             return f.read(self.cfg["state_max_bytes"] + 1)
 
-    def put_state(self, owner, slug, raw, ip=None, via="token"):
+    def put_state(self, owner, slug, raw, ip=None, via="token", if_match=None):
+        """Escribe el estado. Devuelve (bytes, etag_nuevo).
+
+        Con `if_match`, escribe SOLO si lo guardado sigue siendo lo que el que escribe leyo; si
+        no, 412 con el estado actual y su ETag, para mezclar y reintentar. Sin `if_match`,
+        escribe como siempre (las paginas ya publicadas no lo mandan).
+        """
         if len(raw) > self.cfg["state_max_bytes"]:
             raise ApiError(413, "too_large", "el estado supera %d bytes" % self.cfg["state_max_bytes"])
         if not raw.strip():
@@ -767,10 +793,21 @@ class Hub:
         except Exception:
             raise ApiError(400, "bad_json", "el estado tiene que ser JSON valido")
         p = self._state_path(owner, slug)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        self._atomic_write(p, raw)
+        with self.state_lock:
+            if if_match is not None:
+                current = self.get_state(owner, slug)
+                if not same_etag(if_match, state_etag(current)):
+                    try:
+                        shown = json.loads((current or b"{}").decode("utf-8"))
+                    except Exception:
+                        shown = {}
+                    raise ApiError(412, "conflict",
+                                   "alguien cambio el estado despues de que lo leiste: mezcla y reintenta",
+                                   {"etag": state_etag(current), "state": shown})
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            self._atomic_write(p, raw)
         self.log("state", owner, None, slug, len(raw), ip, "por %s" % via)
-        return len(raw)
+        return len(raw), state_etag(raw)
 
     def delete_state(self, owner, slug, ip=None):
         p = self._state_path(owner, slug)
@@ -881,19 +918,37 @@ class Handler(BaseHTTPRequestHandler):
         pass  # nginx ya loguea; no ensuciamos stderr
 
     # ---------- helpers ----------
-    def _send(self, status, payload, ctype="application/json"):
+    def _send(self, status, payload, ctype="application/json", headers=None):
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
     def _err(self, e):
-        self._send(e.status, {"ok": False, "error": e.code, "message": e.message})
+        payload = {"ok": False, "error": e.code, "message": e.message}
+        payload.update(getattr(e, "extra", None) or {})
+        etag = payload.get("etag")
+        self._send(e.status, payload, headers={"ETag": etag} if etag else None)
+
+    def _state_io(self, method, owner, slug, ip, via):
+        """GET y PUT del estado, iguales por clave o por token. El ETag viaja en los dos."""
+        hub = self.hub
+        if method in ("GET", "HEAD"):
+            raw = hub.get_state(owner, slug)
+            return self._send(200, raw if raw is not None else b"{}", "application/json",
+                              headers={"ETag": state_etag(raw)})
+        if method == "PUT":
+            n, etag = hub.put_state(owner, slug, self._body(), ip, via=via,
+                                    if_match=self.headers.get("If-Match"))
+            return self._send(200, {"ok": True, "bytes": n, "etag": etag}, headers={"ETag": etag})
+        return None
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -946,14 +1001,8 @@ class Handler(BaseHTTPRequestHandler):
         hub = self.hub
         try:
             row = hub.check_artifact_key(owner, slug, key)
-            if method in ("GET", "HEAD"):
-                raw = hub.get_state(row["owner"], row["slug"])
-                return self._send(200, raw if raw is not None else b"{}", "application/json")
-            if method == "PUT":
-                raw = self._body()
-                n = hub.put_state(row["owner"], row["slug"], raw, ip, via="clave")
-                return self._send(200, {"ok": True, "bytes": n})
-            raise ApiError(405, "method_not_allowed", "el estado se lee con GET y se escribe con PUT")
+            if self._state_io(method, row["owner"], row["slug"], ip, via="clave") is None:
+                raise ApiError(405, "method_not_allowed", "el estado se lee con GET y se escribe con PUT")
         except ApiError as e:
             self._err(e)
 
@@ -1092,13 +1141,8 @@ class Handler(BaseHTTPRequestHandler):
                 row = hub.artifact_of(rest[1], rest[2])
                 if not ctx["is_admin"] and row["owner"] != ctx["name"]:
                     raise ApiError(403, "not_owner", "ese artifact no es tuyo")
-                if method in ("GET", "HEAD"):
-                    raw = hub.get_state(row["owner"], row["slug"])
-                    return self._send(200, raw if raw is not None else b"{}", "application/json")
-                if method == "PUT":
-                    raw = self._body()
-                    n = hub.put_state(row["owner"], row["slug"], raw, ip, via="token")
-                    return self._send(200, {"ok": True, "bytes": n})
+                if method in ("GET", "HEAD", "PUT"):
+                    return self._state_io(method, row["owner"], row["slug"], ip, via="token")
                 if method == "DELETE":
                     hub.delete_state(row["owner"], row["slug"], ip)
                     return self._send(200, {"ok": True, "removed": True})
