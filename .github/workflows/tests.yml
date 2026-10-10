@@ -130,6 +130,15 @@ jobs:
           printf '<!doctype html><html><head><title>Raiz</title></head><body>x</body></html>' > /tmp/p.html
           curl -sf -X PUT -H "Authorization: Bearer $TOK" -H 'Content-Type: text/html' \
                --data-binary @/tmp/p.html http://127.0.0.1:18091/api/v1/artifacts/raiz >/dev/null
+          # La IP que registra la API es la del VISITANTE: el curl llega desde la red de Docker
+          # (privada, como Traefik en produccion) con un X-Forwarded-For; nginx lo resuelve con
+          # realip y la API lo lee de X-Real-IP. Antes registraba el X-Forwarded-For crudo.
+          curl -sf -X PUT -H "Authorization: Bearer $TOK" -H 'X-Forwarded-For: 203.0.113.7' \
+               -H 'Content-Type: application/json' --data '{"a":1}' \
+               http://127.0.0.1:18091/api/v1/state/ci/raiz >/dev/null
+          ipvista=$(docker exec -u hub api python3 -c "import sqlite3;print(sqlite3.connect('/data/hub.sqlite3').execute(\"select ip from events where action='state' order by id desc limit 1\").fetchone()[0])")
+          [ "$ipvista" = "203.0.113.7" ] || { echo "la API vio la IP '$ipvista' y no la del visitante"; exit 1; }
+          echo "  ok   la API ve la IP del visitante ($ipvista)"
           docker exec api sh -c 'test -f /data/hub.sqlite3' || { echo "la base no esta donde la prueba supone"; exit 1; }
           fail=0
           want() {  # want <codigo-esperado> <ruta>

@@ -1280,5 +1280,90 @@ class TestEstadoConcurrente(Base):
         self.assertEqual(results.count(412), 11, results)
 
 
+
+class TestCupoEstado(Base):
+    """La clave de una pagina la comparten TODOS sus visitantes. Un cupo por clave que cuenta
+    lecturas y escrituras juntas (lo que habia) se agota con ~15 personas mirando un ranking, y
+    una sola persona con el link lo puede agotar para todas. Medido en produccion con un juego:
+    despues de una rafaga, la primera lectura de cualquiera daba 429.
+
+    Ahora: el cupo es por VISITANTE (clave + IP) y aparte para leer y para escribir, con un
+    techo de escrituras por pagina que protege el disco. La IP es la que pone el proxy
+    (X-Real-IP), nunca el X-Forwarded-For que manda el cliente.
+    """
+    overrides = {"state_reads_per_min": 5, "state_writes_per_min": 3, "state_writes_per_min_total": 8}
+
+    def setUp(self):
+        super().setUp()
+        self.pub(self.tok_ana, "juego")
+        self.key = self.req("GET", "/api/v1/artifacts/juego/key", token=self.tok_ana)[1]["key"]
+
+    def as_ip(self, ip, method, data=None):
+        h = {"X-Artifact-Key": self.key, "X-Real-IP": ip}
+        return self.req(method, "/api/v1/state/ana/juego", data=data,
+                        ctype="application/json" if data else None, headers=h)[0]
+
+    def test_leer_no_gasta_el_cupo_de_escribir(self):
+        for _ in range(5):
+            self.assertEqual(self.as_ip("1.1.1.1", "GET"), 200)
+        self.assertEqual(self.as_ip("1.1.1.1", "PUT", b'{"a":1}'), 200)
+
+    def test_un_visitante_que_lee_de_mas_no_frena_a_los_demas(self):
+        codes = [self.as_ip("1.1.1.1", "GET") for _ in range(7)]
+        self.assertIn(429, codes, codes)
+        self.assertEqual(self.as_ip("2.2.2.2", "GET"), 200, "el cupo de uno freno a otro")
+
+    def test_un_visitante_que_escribe_de_mas_no_frena_a_los_demas(self):
+        codes = [self.as_ip("1.1.1.1", "PUT", b'{"a":1}') for _ in range(5)]
+        self.assertIn(429, codes, codes)
+        self.assertEqual(self.as_ip("2.2.2.2", "PUT", b'{"b":2}'), 200)
+
+    def test_la_pagina_tiene_un_techo_de_escrituras_aunque_cambien_las_ips(self):
+        codes = [self.as_ip("9.9.9.%d" % i, "PUT", b'{"a":1}') for i in range(10)]
+        self.assertEqual(codes.count(200), 8, codes)
+        self.assertEqual(codes[8:], [429, 429], codes)
+
+    def test_inventar_x_forwarded_for_no_da_cupo_nuevo(self):
+        codes = [self.req("GET", "/api/v1/state/ana/juego", ctype=None,
+                          headers={"X-Artifact-Key": self.key, "X-Forwarded-For": "6.6.6.%d" % i})[0]
+                 for i in range(7)]
+        self.assertIn(429, codes, "con un X-Forwarded-For distinto cada vez se salteaba el cupo: %s" % codes)
+
+    def test_inventar_x_forwarded_for_no_saltea_el_freno_de_join(self):
+        codes = []
+        for i in range(12):
+            r = urllib.request.Request(self.base + "/api/v1/join", method="POST",
+                                       data=json.dumps({"name": "x", "code": "mal"}).encode(),
+                                       headers={"Content-Type": "application/json",
+                                                "X-Forwarded-For": "6.6.6.%d" % i})
+            try:
+                urllib.request.urlopen(r, timeout=10); codes.append(200)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+        self.assertIn(429, codes, "fuerza bruta del codigo de equipo con IPs inventadas: %s" % codes)
+
+    def test_un_pedido_con_clave_responde_una_sola_vez(self):
+        # _state_io devolvia lo de _send (None) y el handler lo leia como "metodo no permitido":
+        # respondia 200 y DESPUES intentaba un 405 sobre la misma conexion. En produccion, 60
+        # veces en 2 horas.
+        errores, orig = [], Handler._err
+        Handler._err = lambda h, e: (errores.append(e.status), orig(h, e))
+        try:
+            self.assertEqual(self.as_ip("1.1.1.1", "GET"), 200)
+            self.assertEqual(self.as_ip("1.1.1.1", "PUT", b'{"a":1}'), 200)
+            time.sleep(0.1)
+        finally:
+            Handler._err = orig
+        self.assertEqual(errores, [], "respondio y despues mando un error")
+
+    def test_la_memoria_de_cupos_no_crece_sin_fin(self):
+        hub = Handler.hub
+        for i in range(50):
+            hub.check_attempts("prueba:%d" % i, limit=5, window=0.01)
+        time.sleep(0.05)
+        hub.check_attempts("otra", limit=5, window=0.01, sweep_over=10)
+        self.assertLessEqual(len([k for k in hub.attempts if k.startswith("prueba:")]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

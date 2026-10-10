@@ -49,7 +49,12 @@ DEFAULTS = {
     "max_app_files": int(os.environ.get("HUB_MAX_APP_FILES", 1000)),
     # ESTADO de un artifact vivo: lo que la pagina guarda y el agente lee.
     "state_max_bytes": int(os.environ.get("HUB_STATE_MAX_BYTES", 64 * 1024)),
-    "state_writes_per_min": int(os.environ.get("HUB_STATE_WRITES_PER_MIN", 60)),
+    # Cupos de la clave de una pagina. La clave la comparten TODOS sus visitantes, asi que el
+    # cupo es por VISITANTE (clave + IP), aparte para leer y para escribir; y un techo de
+    # escrituras por pagina, que protege el disco aunque cambien las IPs.
+    "state_reads_per_min": int(os.environ.get("HUB_STATE_READS_PER_MIN", 120)),
+    "state_writes_per_min": int(os.environ.get("HUB_STATE_WRITES_PER_MIN", 30)),
+    "state_writes_per_min_total": int(os.environ.get("HUB_STATE_WRITES_PER_MIN_TOTAL", 600)),
     # VISTA PREVIA (og:image) que el cliente genera al publicar.
     "thumb_max_bytes": int(os.environ.get("HUB_THUMB_MAX_BYTES", 1024 * 1024)),
     # Secreto para derivar las claves de estado. Vacio = se genera y queda en settings.
@@ -314,14 +319,20 @@ class Hub:
             "token_id": row["id"], "prefix": row["prefix"], "label": row["label"],
         }
 
-    def check_attempts(self, key, limit=10, window=300):
-        """Frena la fuerza bruta sobre el codigo de equipo. En memoria: alcanza con una replica."""
+    def check_attempts(self, key, limit=10, window=300, sweep_over=5000):
+        """Cupo en memoria (alcanza con una replica): fuerza bruta del codigo de equipo y cupos
+        de estado. Las claves llevan IPs, asi que se barren las vencidas: si no, el dict crece
+        con cada visitante que paso alguna vez."""
+        now = time.time()
         with self.lock:
-            hits = [t for t in self.attempts.get(key, []) if t > time.time() - window]
+            if len(self.attempts) > sweep_over:
+                for k in [k for k, (w, h) in self.attempts.items() if not h or h[-1] <= now - w]:
+                    del self.attempts[k]
+            hits = [t for t in self.attempts.get(key, (window, []))[1] if t > now - window]
             if len(hits) >= limit:
                 raise ApiError(429, "too_many_attempts", "demasiados intentos, esperá unos minutos")
-            hits.append(time.time())
-            self.attempts[key] = hits
+            hits.append(now)
+            self.attempts[key] = (window, hits)
 
     def join(self, name, code, ip=None):
         if not SLUG_RE.match(name or ""):
@@ -757,9 +768,16 @@ class Hub:
             raise ApiError(403, "revoked_key", "la clave de ese artifact fue revocada")
         if not hmac.compare_digest(self._state_key(row["owner"], row["slug"], epoch), key):
             raise ApiError(401, "bad_key", "clave de artifact invalida")
-        # limite propio: las escrituras por clave no pasan por el cupo de un token
-        self.check_attempts("st:" + key[:32], limit=self.cfg["state_writes_per_min"], window=60)
         return row
+
+    def check_state_quota(self, key, method, ip):
+        """Cupo de la clave de una pagina, por visitante. Ver state_reads_per_min."""
+        k = key[:32]
+        if method in ("GET", "HEAD"):
+            self.check_attempts("sr:%s:%s" % (k, ip), limit=self.cfg["state_reads_per_min"], window=60)
+        else:
+            self.check_attempts("sw:%s:%s" % (k, ip), limit=self.cfg["state_writes_per_min"], window=60)
+            self.check_attempts("swt:" + k, limit=self.cfg["state_writes_per_min_total"], window=60)
 
     def reveal_key(self, owner, slug):
         """La clave de estado de un artifact, para quien firma el token (nunca en un log)."""
@@ -942,13 +960,15 @@ class Handler(BaseHTTPRequestHandler):
         hub = self.hub
         if method in ("GET", "HEAD"):
             raw = hub.get_state(owner, slug)
-            return self._send(200, raw if raw is not None else b"{}", "application/json",
-                              headers={"ETag": state_etag(raw)})
+            self._send(200, raw if raw is not None else b"{}", "application/json",
+                       headers={"ETag": state_etag(raw)})
+            return True
         if method == "PUT":
             n, etag = hub.put_state(owner, slug, self._body(), ip, via=via,
                                     if_match=self.headers.get("If-Match"))
-            return self._send(200, {"ok": True, "bytes": n, "etag": etag}, headers={"ETag": etag})
-        return None
+            self._send(200, {"ok": True, "bytes": n, "etag": etag}, headers={"ETag": etag})
+            return True
+        return False
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1001,14 +1021,15 @@ class Handler(BaseHTTPRequestHandler):
         hub = self.hub
         try:
             row = hub.check_artifact_key(owner, slug, key)
-            if self._state_io(method, row["owner"], row["slug"], ip, via="clave") is None:
+            hub.check_state_quota(key, method, ip)
+            if not self._state_io(method, row["owner"], row["slug"], ip, via="clave"):
                 raise ApiError(405, "method_not_allowed", "el estado se lee con GET y se escribe con PUT")
         except ApiError as e:
             self._err(e)
 
     def _handle(self, method):
         hub = self.hub
-        ip = self.headers.get("X-Forwarded-For", self.client_address[0])
+        ip = hub_web.client_ip(self)
         try:
             seg, q = self._parts()
             # ¿viene del hostname de la interfaz web? Entonces la atiende web.py.

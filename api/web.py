@@ -24,6 +24,13 @@ LOGIN_CODE_MIN = 10
 COOKIE = "hub_session"
 
 
+
+def client_ip(handler):
+    """La IP de quien hace el pedido. La pone nginx en X-Real-IP (con el modulo realip ya
+    resuelto contra el proxy de adelante); el X-Forwarded-For lo puede escribir el cliente y
+    con el se salteaban los cupos. La API no se publica: solo nginx llega hasta aca."""
+    return (handler.headers.get("X-Real-IP") or handler.client_address[0]).strip()
+
 def now():
     return int(time.time())
 
@@ -566,7 +573,7 @@ def serve(handler, hub, method, path, query, form):
     session = get_session(hub, sid)
     if session:
         session["_csrf"] = session["csrf"]
-    ip = handler.headers.get("X-Forwarded-For", handler.client_address[0])
+    ip = client_ip(handler)
     def out(status, body, ctype="text/html; charset=utf-8", cookie=None, location=None):
         return status, ctype, body.encode() if isinstance(body, str) else body, cookie, location
 
