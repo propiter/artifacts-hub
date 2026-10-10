@@ -63,3 +63,29 @@ jobs:
         run: |
           docker run --rm -v "$PWD/store/default.conf:/etc/nginx/conf.d/default.conf:ro" \
             nginx:1.27-alpine nginx -t
+
+  # La suite corre desde el codigo fuente, asi que NO ve lo que falta en la imagen: un modulo
+  # nuevo que el Dockerfile no copia pasa todos los tests y tira produccion al arrancar
+  # (paso con meta.py). Esto construye la imagen DE VERDAD, la levanta y publica con ella.
+  imagen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: La imagen arranca y publica
+        run: |
+          docker build -t hub:ci api/
+          D=$(mktemp -d); chmod 777 "$D"
+          docker run -d --name hub -p 18090:8080 -e HUB_DATA=/data -e HUB_DB=/data/hub.sqlite3 \
+            -e HUB_BASE_URL=http://127.0.0.1:18090 -v "$D":/data hub:ci
+          for i in $(seq 1 40); do curl -sf http://127.0.0.1:18090/healthz >/dev/null && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:18090/healthz || { echo "la imagen no arranco:"; docker logs hub; exit 1; }
+          docker exec -u hub hub python3 admin.py user add ci >/dev/null
+          TOK=$(docker exec -u hub hub python3 admin.py token add ci --label ci | grep -o 'wlart_[a-f0-9]*' | head -1)
+          [ -n "$TOK" ] || { echo "no pude sacar un token de la imagen"; exit 1; }
+          printf '<!doctype html><html><head><title>Imagen</title></head><body>x</body></html>' > /tmp/p.html
+          code=$(curl -s -o /tmp/r.json -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOK" \
+                   -H 'Content-Type: text/html' --data-binary @/tmp/p.html \
+                   http://127.0.0.1:18090/api/v1/artifacts/imagen)
+          [ "$code" = "201" ] || [ "$code" = "200" ] || { echo "publicar dio $code"; cat /tmp/r.json; docker logs hub; exit 1; }
+          grep -q 'window.ARTIFACT=' "$D/a/ci/imagen.html" || { echo "la imagen no inyecta el runtime"; exit 1; }
+          echo "imagen OK"
