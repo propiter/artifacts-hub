@@ -37,8 +37,10 @@ services:
       # en el entorno del servicio (Dokploy -> Environment) y el compose solo la referencia.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      HUB_AI_MODEL: ${HUB_AI_MODEL:-}
-      HUB_AI_MODELS: ${HUB_AI_MODELS:-}
+      # el modelo no es secreto: va aca. gpt-6-luna = el rapido y suficiente (medido: ~4 s,
+      # buena calidad); gpt-6-sol = el que una pagina puede pedir para algo mas exigente.
+      HUB_AI_MODEL: ${HUB_AI_MODEL:-gpt-6-luna}
+      HUB_AI_MODELS: ${HUB_AI_MODELS:-gpt-6-sol}
     volumes:
       - hub-data:/data
       # las semillas del docroot (landing + 50x). El entrypoint las copia al volumen.

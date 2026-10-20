@@ -1411,7 +1411,7 @@ class TestRuntime(Base):
                            capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, "\n" + r.stdout + r.stderr)
         self.assertNotIn("FAIL", r.stdout)
-        self.assertGreaterEqual(r.stdout.count("ok   "), 23, r.stdout)
+        self.assertGreaterEqual(r.stdout.count("ok   "), 24, r.stdout)
 
 
 class FakeAI:
@@ -1564,10 +1564,23 @@ class TestIA(Base):
         mine = [k for k, (w, hits) in Handler.hub.attempts.items() if k.startswith("aih:") and k.endswith(":8.8.8.8")]
         self.assertTrue(all(not Handler.hub.attempts[k][1] for k in mine), "le gasto el cupo a un rechazado")
 
+    def test_info_dice_modelos_y_topes_sin_gastar_cupo(self):
+        for _ in range(5):
+            s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None, headers={"X-Artifact-Key": self.key})
+            self.assertEqual(s, 200, b)
+        self.assertEqual(b, {"ok": True, "available": True, "model": "modelo-bueno",
+                             "models": ["modelo-bueno", "modelo-chico"], "per_visitor_hour": 3, "per_page_day": 5})
+        self.assertEqual(self.ask({"prompt": "x"})[0], 200, "consultar info gasto cupo")
+        self.assertNotIn(FakeAI.KEY, json.dumps(b))
+        s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None)
+        self.assertEqual(s, 401)
+
     def test_hub_sin_ia_lo_dice(self):
         Handler.hub.cfg["ai_key"] = ""
         s, b = self.ask({"prompt": "x"})
         self.assertEqual((s, b["error"]), (503, "ai_off"))
+        s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None, headers={"X-Artifact-Key": self.key})
+        self.assertEqual((s, b["available"], b["models"]), (200, False, []))
 
 
 if __name__ == "__main__":

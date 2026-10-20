@@ -283,6 +283,14 @@
     handle("\n\n");
     return full;
   };
+  /** {available, model, models, per_visitor_hour, per_page_day}: si esta pagina tiene IA y con
+   *  que modelos. No gasta cupo. Para mostrar "IA no disponible" antes de que el visitante escriba. */
+  A.ai.info = async function () {
+    var r = await fetch(aiUrl(), { headers: { "X-Artifact-Key": A.key }, cache: "no-store" }), b = await json(r);
+    if (!r.ok) throw fail(r.status, b.error || "http_" + r.status, b.message);
+    delete b.ok;
+    return b;
+  };
   /** Devuelve un OBJETO: para generadores (un pitch con partes, opciones, una clasificacion).
    *  Decile en el prompt que forma queres: "{titulo, puntos: [..], cierre}". */
   A.ai.json = async function (input, opts) {

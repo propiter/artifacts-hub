@@ -1051,6 +1051,20 @@ class Handler(BaseHTTPRequestHandler):
         if method != "HEAD" and body:
             self.wfile.write(body)
 
+    def _ai_info(self, owner, slug, key):
+        """Si la pagina tiene IA, con que modelos y que topes. No gasta cupo."""
+        hub = self.hub
+        try:
+            hub.check_artifact_key(owner, slug, key or "")
+            on = hub_ai.enabled(hub.cfg)
+            self._send(200, {"ok": True, "available": on,
+                             "model": hub.cfg["ai_model"] if on else None,
+                             "models": hub_ai.models(hub.cfg) if on else [],
+                             "per_visitor_hour": hub.cfg["ai_per_visitor_hour"],
+                             "per_page_day": hub.cfg["ai_per_page_day"]})
+        except ApiError as e:
+            self._err(e)
+
     def _ai_with_key(self, owner, slug, key, ip):
         hub = self.hub
         try:
@@ -1149,8 +1163,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._state_with_key(method, rest[1], rest[2], art_key, ip)
             # IA por CLAVE DE ARTIFACT: la pagina pide, el hub llama al proveedor con SU clave.
             if len(rest) == 3 and rest[0] == "ai":
+                if method == "GET":
+                    return self._ai_info(rest[1], rest[2], art_key)
                 if method != "POST":
-                    raise ApiError(405, "method_not_allowed", "la IA se pide con POST")
+                    raise ApiError(405, "method_not_allowed", "la IA se pide con POST (y se consulta con GET)")
                 return self._ai_with_key(rest[1], rest[2], art_key, ip)
 
             ctx = hub.authenticate(self.headers.get("Authorization"))

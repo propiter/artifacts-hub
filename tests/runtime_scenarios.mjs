@@ -222,6 +222,12 @@ await scenario("A.ai devuelve el texto", async () => {
   assert.equal(await A.ai({ system: "Sos breve", prompt: "corto" }, { model: "modelo-chico" }), "**eco** (1): corto");
 });
 
+await scenario("A.ai.info dice si hay IA y con que modelos", async () => {
+  const i = await visitor().ai.info();
+  assert.equal(i.available, true); assert.equal(i.model, "modelo-bueno");
+  assert.deepEqual(i.models, ["modelo-bueno", "modelo-chico"]);
+});
+
 await scenario("A.ai.stream llega por pedazos y devuelve el total", async () => {
   const A = visitor(), pieces = [];
   const full = await A.ai.stream("uno dos tres cuatro", (t, sofar) => pieces.push(sofar));
