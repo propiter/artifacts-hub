@@ -1372,6 +1372,15 @@ class TestRuntime(Base):
     overrides = {"state_reads_per_min": 10000, "state_writes_per_min": 10000,
                  "state_writes_per_min_total": 10000}
 
+    def setUp(self):
+        self.fake = FakeAI()
+        self.overrides = dict(self.overrides, **self.fake.cfg(), ai_per_visitor_hour=1000,
+                              ai_per_page_day=1000)
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown(); self.fake.close()
+
     def served_runtime(self):
         self.pub(self.tok_ana, "juego")
         h = self.read(os.path.join(self.tmp, "a", "ana", "juego.html"))
@@ -1385,7 +1394,7 @@ class TestRuntime(Base):
         self.assertIn(b"A.save = async function", js)
         self.assertNotIn(b"</", js)
         self.assertNotIn(b"/*", js, "los comentarios no tienen que viajar en cada pagina")
-        self.assertLess(len(js), 12000)
+        self.assertLess(len(js), 16000, "viaja inline en CADA pagina: que no engorde sin motivo")
 
     def test_los_escenarios_corren_en_node(self):
         node = shutil.which("node")
@@ -1402,7 +1411,163 @@ class TestRuntime(Base):
                            capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, "\n" + r.stdout + r.stderr)
         self.assertNotIn("FAIL", r.stdout)
-        self.assertGreaterEqual(r.stdout.count("ok   "), 17, r.stdout)
+        self.assertGreaterEqual(r.stdout.count("ok   "), 23, r.stdout)
+
+
+class FakeAI:
+    """Un proveedor compatible con OpenAI de mentira. Registra lo que recibe (para probar que
+    lleva la clave, el modelo y el techo de tokens) y contesta un eco determinista."""
+    KEY = "sk-test-" + "9" * 40
+
+    def __init__(self, fail_with=None):
+        import http.server
+        fake = self
+        self.seen, self.fail_with = [], fail_with
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                fake.seen.append({"auth": self.headers.get("Authorization"), "body": body,
+                                  "path": self.path})
+                if fake.fail_with:
+                    raw = json.dumps({"error": {"message": "falla de prueba " + FakeAI.KEY}}).encode()
+                    self.send_response(fake.fail_with); self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers(); self.wfile.write(raw); return
+                last = [m["content"] for m in body["messages"] if m["role"] == "user"][-1]
+                turns = sum(1 for m in body["messages"] if m["role"] == "user")
+                text = ('{"eco": %s, "turnos": %d}' % (json.dumps(last), turns) if body.get("response_format")
+                        else "**eco** (%d): %s" % (turns, last))
+                if body.get("stream"):
+                    self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                    for w in text.split(" "):
+                        ev = {"choices": [{"delta": {"content": w + " "}}]}
+                        self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n"); self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n"); return
+                raw = json.dumps({"model": body["model"], "choices": [{"message": {"content": text}}],
+                                  "usage": {"total_tokens": 7}}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/v1" % self.srv.server_address[1]
+
+    def cfg(self):
+        return {"ai_key": self.KEY, "ai_base_url": self.url, "ai_model": "modelo-bueno",
+                "ai_models": "modelo-chico"}
+
+    def close(self):
+        self.srv.shutdown(); self.srv.server_close()
+
+
+class TestIA(Base):
+    """La pagina pide IA con SU clave de artifact; el hub llama al proveedor con la clave del
+    servidor, que no sale nunca. Modelos permitidos, techo de tokens y cupos que cuestan plata."""
+    overrides = {"ai_per_visitor_hour": 3, "ai_per_page_day": 5, "ai_max_tokens": 500,
+                 "ai_max_input_chars": 2000}
+
+    def setUp(self):
+        self.fake = FakeAI()
+        self.overrides = dict(self.overrides, **self.fake.cfg())
+        super().setUp()
+        self.pub(self.tok_ana, "pitch")
+        self.key = self.req("GET", "/api/v1/artifacts/pitch/key", token=self.tok_ana)[1]["key"]
+
+    def tearDown(self):
+        super().tearDown(); self.fake.close()
+
+    def ask(self, body, ip="1.1.1.1", key=None):
+        return self.req("POST", "/api/v1/ai/ana/pitch", data=json.dumps(body).encode(),
+                        ctype="application/json",
+                        headers={"X-Artifact-Key": key or self.key, "X-Real-IP": ip})
+
+    def test_responde_y_el_proveedor_recibe_la_clave_del_servidor(self):
+        s, b = self.ask({"system": "Sos vendedor", "prompt": "un pitch"})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["text"], "**eco** (1): un pitch")
+        seen = self.fake.seen[-1]
+        self.assertEqual(seen["path"], "/v1/chat/completions")
+        self.assertEqual(seen["auth"], "Bearer " + FakeAI.KEY)
+        self.assertEqual(seen["body"]["model"], "modelo-bueno")
+        self.assertEqual(seen["body"]["max_tokens"], 500)
+        self.assertEqual([m["role"] for m in seen["body"]["messages"]], ["system", "user"])
+
+    def test_la_clave_del_proveedor_no_sale_nunca(self):
+        h = self.read(os.path.join(self.tmp, "a", "ana", "pitch.html"))
+        self.assertNotIn(FakeAI.KEY.encode(), h)
+        self.fake.fail_with = 500
+        s, b = self.ask({"prompt": "hola"})
+        self.assertEqual(s, 502); self.assertEqual(b["error"], "ai_upstream")
+        self.assertNotIn(FakeAI.KEY, json.dumps(b), "el error del proveedor filtro la clave")
+
+    def test_sin_clave_de_artifact_o_con_una_falsa_no_hay_ia(self):
+        s, b = self.req("POST", "/api/v1/ai/ana/pitch", data=b'{"prompt":"x"}', ctype="application/json")
+        self.assertEqual(s, 401)
+        s, b = self.ask({"prompt": "x"}, key="art_" + "0" * 40)
+        self.assertEqual(s, 401)
+        self.assertEqual(self.fake.seen, [])
+
+    def test_modelo_no_permitido_y_techo_de_tokens(self):
+        s, b = self.ask({"prompt": "x", "model": "el-mas-caro"})
+        self.assertEqual((s, b["error"]), (400, "bad_model"))
+        s, b = self.ask({"prompt": "x", "model": "modelo-chico", "max_tokens": 99999})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.fake.seen[-1]["body"]["model"], "modelo-chico")
+        self.assertEqual(self.fake.seen[-1]["body"]["max_tokens"], 500)
+
+    def test_pedidos_invalidos_no_llegan_al_proveedor_ni_gastan_cupo(self):
+        for body in ({}, {"prompt": "  "}, {"messages": [{"role": "hacker", "content": "x"}]},
+                     {"prompt": "x" * 3000}):
+            s, b = self.ask(body)
+            self.assertIn(s, (400, 413), (body, b))
+        self.assertEqual(self.fake.seen, [])
+        for _ in range(3):
+            self.assertEqual(self.ask({"prompt": "ok"})[0], 200)
+
+    def test_modo_json(self):
+        s, b = self.ask({"prompt": "dame algo", "json": True})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(json.loads(b["text"])["eco"], "dame algo")
+        sent = self.fake.seen[-1]["body"]
+        self.assertEqual(sent["response_format"], {"type": "json_object"})
+        self.assertIn("json", json.dumps(sent["messages"]).lower(), "el modo JSON exige decir JSON")
+
+    def test_en_vivo_llega_por_pedazos(self):
+        r = urllib.request.Request(self.base + "/api/v1/ai/ana/pitch", method="POST",
+                                   data=json.dumps({"prompt": "uno dos tres", "stream": True}).encode(),
+                                   headers={"Content-Type": "application/json", "X-Artifact-Key": self.key})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            self.assertEqual(resp.headers.get("X-Accel-Buffering"), "no")
+            self.assertTrue(resp.headers.get("Content-Type", "").startswith("text/event-stream"))
+            events = [json.loads(l[5:]) for l in resp.read().decode().split("\n\n") if l.startswith("data:")]
+        self.assertGreater(len(events), 3)
+        self.assertEqual("".join(e.get("t", "") for e in events).strip(), "**eco** (1): uno dos tres")
+        self.assertEqual(events[-1], {"done": True})
+
+    def test_cupo_por_visitante_por_hora(self):
+        codes = [self.ask({"prompt": "x"}, ip="1.1.1.1")[0] for _ in range(4)]
+        self.assertEqual(codes, [200, 200, 200, 429])
+        s, b = self.ask({"prompt": "x"}, ip="1.1.1.1")
+        self.assertEqual(b["error"], "ai_rate_limited"); self.assertGreater(b["retry_after"], 0)
+        self.assertEqual(self.ask({"prompt": "x"}, ip="2.2.2.2")[0], 200, "el cupo de uno freno a otro")
+
+    def test_cupo_por_pagina_por_dia(self):
+        codes = [self.ask({"prompt": "x"}, ip="9.9.9.%d" % i)[0] for i in range(7)]
+        self.assertEqual(codes.count(200), 5, codes)
+        s, b = self.ask({"prompt": "x"}, ip="8.8.8.8")
+        self.assertEqual(b["error"], "ai_page_limit")
+        # rechazado por la pagina: al visitante no se le desconto nada de su hora
+        mine = [k for k, (w, hits) in Handler.hub.attempts.items() if k.startswith("aih:") and k.endswith(":8.8.8.8")]
+        self.assertTrue(all(not Handler.hub.attempts[k][1] for k in mine), "le gasto el cupo a un rechazado")
+
+    def test_hub_sin_ia_lo_dice(self):
+        Handler.hub.cfg["ai_key"] = ""
+        s, b = self.ask({"prompt": "x"})
+        self.assertEqual((s, b["error"]), (503, "ai_off"))
 
 
 if __name__ == "__main__":

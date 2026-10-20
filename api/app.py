@@ -27,6 +27,7 @@ from urllib.parse import urlparse, parse_qs
 
 import web as hub_web
 import meta as hub_meta
+import ai as hub_ai
 
 MAX_BODY_HARD = 16 * 1024 * 1024
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
@@ -57,6 +58,19 @@ DEFAULTS = {
     "state_writes_per_min_total": int(os.environ.get("HUB_STATE_WRITES_PER_MIN_TOTAL", 600)),
     # VISTA PREVIA (og:image) que el cliente genera al publicar.
     "thumb_max_bytes": int(os.environ.get("HUB_THUMB_MAX_BYTES", 1024 * 1024)),
+    # IA para las paginas (ai.py). La clave vive SOLO en el servidor; acepta los nombres de
+    # siempre (OPENAI_API_KEY / OPENAI_BASE_URL). Sin clave, sin URL o sin modelo: apagada.
+    "ai_key": os.environ.get("HUB_AI_KEY") or os.environ.get("OPENAI_API_KEY", ""),
+    "ai_base_url": os.environ.get("HUB_AI_BASE_URL") or os.environ.get("OPENAI_BASE_URL", ""),
+    "ai_model": os.environ.get("HUB_AI_MODEL", ""),
+    "ai_models": os.environ.get("HUB_AI_MODELS", ""),      # otros permitidos, separados por coma
+    "ai_per_visitor_hour": int(os.environ.get("HUB_AI_PER_VISITOR_HOUR", 20)),
+    "ai_per_page_day": int(os.environ.get("HUB_AI_PER_PAGE_DAY", 500)),
+    "ai_max_tokens": int(os.environ.get("HUB_AI_MAX_TOKENS", 2000)),
+    "ai_max_input_chars": int(os.environ.get("HUB_AI_MAX_INPUT_CHARS", 60000)),
+    "ai_max_messages": int(os.environ.get("HUB_AI_MAX_MESSAGES", 60)),
+    "ai_tokens_param": os.environ.get("HUB_AI_TOKENS_PARAM", "max_tokens"),
+    "ai_timeout": int(os.environ.get("HUB_AI_TIMEOUT", 120)),
     # Secreto para derivar las claves de estado. Vacio = se genera y queda en settings.
     "state_key_secret": os.environ.get("HUB_STATE_SECRET", ""),
 }
@@ -330,7 +344,8 @@ class Hub:
                     del self.attempts[k]
             hits = [t for t in self.attempts.get(key, (window, []))[1] if t > now - window]
             if len(hits) >= limit:
-                raise ApiError(429, "too_many_attempts", "demasiados intentos, esperá unos minutos")
+                raise ApiError(429, "too_many_attempts", "demasiados intentos, esperá unos minutos",
+                               {"retry_after": int(hits[0] + window - now) + 1})
             hits.append(now)
             self.attempts[key] = (window, hits)
 
@@ -771,6 +786,25 @@ class Hub:
             raise ApiError(401, "bad_key", "clave de artifact invalida")
         return row
 
+    def check_ai_quota(self, key, ip):
+        """Cupos de IA de una pagina: por visitante por hora y por pagina por dia. Se miran LOS
+        DOS antes de descontar: un pedido rechazado por uno no gasta el otro (si no, un visitante
+        insistiendo contra su tope le comeria el cupo del dia a toda la pagina)."""
+        k, now = key[:32], time.time()
+        rules = [("aih:%s:%s" % (k, ip), self.cfg["ai_per_visitor_hour"], 3600, "ai_rate_limited",
+                  "llegaste a %d pedidos de IA por hora: proba en un rato" % self.cfg["ai_per_visitor_hour"]),
+                 ("aid:" + k, self.cfg["ai_per_page_day"], 86400, "ai_page_limit",
+                  "esta pagina llego a sus %d pedidos de IA de hoy" % self.cfg["ai_per_page_day"])]
+        with self.lock:
+            live = []
+            for name, limit, window, code, message in rules:
+                hits = [h for h in self.attempts.get(name, (window, []))[1] if h > now - window]
+                if len(hits) >= limit:
+                    raise ApiError(429, code, message, {"retry_after": int(hits[0] + window - now) + 1})
+                live.append((name, window, hits))
+            for name, window, hits in live:
+                self.attempts[name] = (window, hits + [now])
+
     def check_state_quota(self, key, method, ip):
         """Cupo de la clave de una pagina, por visitante. Ver state_reads_per_min."""
         k = key[:32]
@@ -1017,6 +1051,59 @@ class Handler(BaseHTTPRequestHandler):
         if method != "HEAD" and body:
             self.wfile.write(body)
 
+    def _ai_with_key(self, owner, slug, key, ip):
+        hub = self.hub
+        try:
+            if not hub_ai.enabled(hub.cfg):
+                raise ApiError(503, "ai_off", "este hub no tiene IA configurada")
+            row = hub.check_artifact_key(owner, slug, key or "")
+            try:
+                body = json.loads(self._body().decode("utf-8") or "{}")
+            except ValueError:
+                raise ApiError(400, "bad_json", "el pedido tiene que ser JSON")
+            try:
+                payload, stream = hub_ai.build(hub.cfg, body)
+            except hub_ai.AiError as e:
+                raise ApiError(e.status, e.code, e.message)
+            hub.check_ai_quota(key, ip)                 # recien aca: un pedido invalido no gasta cupo
+            hub.log("ai", row["owner"], None, row["slug"], None, ip, payload["model"])
+            try:
+                if stream:
+                    return self._ai_stream(payload)
+                out = hub_ai.complete(hub.cfg, payload)
+            except hub_ai.AiError as e:
+                raise ApiError(e.status, e.code, e.message)
+            out["ok"] = True
+            self._send(200, out)
+        except ApiError as e:
+            self._err(e)
+
+    def _ai_stream(self, payload):
+        """Respuesta en vivo: un evento SSE por pedazo de texto. Si el proveedor falla antes de
+        empezar, es un error JSON normal; si falla en el medio, un evento {error}."""
+        resp = hub_ai.open_stream(self.hub.cfg, payload)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")      # nginx: no juntar, mandar ya
+            self.send_header("X-Robots-Tag", "noindex, nofollow")
+            self.end_headers()
+
+            def event(obj):
+                self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                self.wfile.flush()
+            try:
+                for piece in hub_ai.iter_stream(self.hub.cfg, resp):
+                    event({"t": piece})
+                event({"done": True})
+            except hub_ai.AiError as e:
+                event({"error": e.code, "message": e.message})
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                         # el visitante cerro la pagina
+        finally:
+            resp.close()
+
     def _state_with_key(self, method, owner, slug, key, ip):
         """Lectura y escritura de estado con la clave del artifact. Sin token."""
         hub = self.hub
@@ -1060,6 +1147,11 @@ class Handler(BaseHTTPRequestHandler):
             art_key = self.headers.get("X-Artifact-Key")
             if art_key and len(rest) == 3 and rest[0] == "state":
                 return self._state_with_key(method, rest[1], rest[2], art_key, ip)
+            # IA por CLAVE DE ARTIFACT: la pagina pide, el hub llama al proveedor con SU clave.
+            if len(rest) == 3 and rest[0] == "ai":
+                if method != "POST":
+                    raise ApiError(405, "method_not_allowed", "la IA se pide con POST")
+                return self._ai_with_key(rest[1], rest[2], art_key, ip)
 
             ctx = hub.authenticate(self.headers.get("Authorization"))
 

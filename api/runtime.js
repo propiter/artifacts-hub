@@ -226,6 +226,147 @@
   /** Id anonimo y estable de este navegador. Sirve para "lo mio" y un-voto-por-navegador. */
   A.visitor = A.local.get("visitor") || (function () { var v = "v_" + rid(); A.local.set("visitor", v); return v; })();
 
+  // ---------- IA: el hub llama al modelo con SU clave; la pagina nunca la ve ----------
+  function aiUrl() {
+    return A.api + "/api/v1/ai/" + encodeURIComponent(A.owner) + "/" + encodeURIComponent(A.slug);
+  }
+  function aiBody(input, opts) {
+    var b;
+    if (typeof input === "string") b = { prompt: input };
+    else if (isObj(input)) b = copy(input);
+    else throw fail(0, "bad_input", "A.ai recibe un texto o {system, messages, prompt}");
+    return Object.assign(b, copy(opts || {}));
+  }
+  async function aiPost(body) {
+    var r = await fetch(aiUrl(), { method: "POST", cache: "no-store", body: JSON.stringify(body),
+      headers: { "X-Artifact-Key": A.key, "Content-Type": "application/json" } });
+    if (!r.ok) {
+      var b = await json(r), e = fail(r.status, b.error || "http_" + r.status, b.message);
+      if (b.retry_after) e.retryAfter = b.retry_after;
+      throw e;
+    }
+    return r;
+  }
+  function looseJson(text) {
+    var t = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+    try { return JSON.parse(t); } catch (e) {}
+    var a = t.indexOf("{"), z = t.lastIndexOf("}");
+    if (a >= 0 && z > a) { try { return JSON.parse(t.slice(a, z + 1)); } catch (e) {} }
+    throw fail(502, "ai_bad_json", "la IA no devolvio un JSON valido");
+  }
+
+  /** Le pide algo al modelo y devuelve el texto. `input`: un texto, o {system, messages,
+   *  prompt}. `opts`: {model, max_tokens, temperature}. */
+  A.ai = async function (input, opts) {
+    var r = await aiPost(aiBody(input, opts));
+    return (await r.json()).text || "";
+  };
+  /** Igual, pero llega en vivo: onText(pedazo, textoHastaAhora) por cada pedazo. Devuelve el
+   *  texto completo. Para que el visitante vea la respuesta escribirse. */
+  A.ai.stream = async function (input, onText, opts) {
+    var body = aiBody(input, opts); body.stream = true;
+    var r = await aiPost(body), full = "", buf = "";
+    function handle(chunk) {
+      buf += chunk;
+      var parts = buf.split("\n\n"); buf = parts.pop();
+      parts.forEach(function (p) {
+        if (p.indexOf("data:") !== 0) return;
+        var ev; try { ev = JSON.parse(p.slice(5)); } catch (e) { return; }
+        if (ev.error) throw fail(502, ev.error, ev.message);
+        if (ev.t) { full += ev.t; if (onText) onText(ev.t, full); }
+      });
+    }
+    if (r.body && r.body.getReader) {
+      var reader = r.body.getReader(), dec = new TextDecoder();
+      for (;;) { var x = await reader.read(); if (x.done) break; handle(dec.decode(x.value, { stream: true })); }
+    } else handle(await r.text());
+    handle("\n\n");
+    return full;
+  };
+  /** Devuelve un OBJETO: para generadores (un pitch con partes, opciones, una clasificacion).
+   *  Decile en el prompt que forma queres: "{titulo, puntos: [..], cierre}". */
+  A.ai.json = async function (input, opts) {
+    var body = aiBody(input, opts); body.json = true;
+    var r = await aiPost(body);
+    return looseJson((await r.json()).text);
+  };
+  /** Una conversacion que recuerda lo dicho (tipo ChatGPT). {system, model, keep: 20}.
+   *  c.send(texto, onText?) -> respuesta · c.history · c.reset(). */
+  A.ai.chat = function (opts) {
+    var o = opts || {}, hist = [];
+    return {
+      history: hist,
+      send: async function (text, onText) {
+        hist.push({ role: "user", content: String(text) });
+        var input = { system: o.system, messages: hist.slice(-(o.keep || 20)) };
+        var extra = { model: o.model, max_tokens: o.max_tokens, temperature: o.temperature };
+        Object.keys(extra).forEach(function (k) { if (extra[k] === undefined) delete extra[k]; });
+        try {
+          var out = onText ? await A.ai.stream(input, onText, extra) : await A.ai(input, extra);
+          hist.push({ role: "assistant", content: out });
+          return out;
+        } catch (e) { hist.pop(); throw e; }
+      },
+      reset: function () { hist.length = 0; }
+    };
+  };
+
+  // ---------- markdown seguro: lo que escribe una IA, como DOM y nunca como HTML ----------
+  function inline(parent, s) {
+    var re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g, last = 0, m, e;
+    while ((m = re.exec(s))) {
+      if (m.index > last) parent.appendChild(document.createTextNode(s.slice(last, m.index)));
+      var t = m[0];
+      if (t[0] === "`") { e = document.createElement("code"); e.textContent = t.slice(1, -1); }
+      else if (t.slice(0, 2) === "**") { e = document.createElement("strong"); inline(e, t.slice(2, -2)); }
+      else if (t[0] === "*") { e = document.createElement("em"); inline(e, t.slice(1, -1)); }
+      else {
+        var k = t.indexOf("](");
+        e = document.createElement("a"); e.textContent = t.slice(1, k); e.href = t.slice(k + 2, -1);
+        e.target = "_blank"; e.rel = "noopener noreferrer";
+      }
+      parent.appendChild(e); last = re.lastIndex;
+    }
+    if (last < s.length) parent.appendChild(document.createTextNode(s.slice(last)));
+  }
+  var LIST = /^\s*([-*\u2022]|\d+[.)])\s+/;
+  /** Pinta `text` (markdown: titulos, listas, **negrita**, *italica*, `codigo`, bloques ```,
+   *  links http) dentro de `target`, reemplazando lo que habia. Sin innerHTML: un <script> en
+   *  la respuesta queda como texto. Llamalo en cada pedazo de A.ai.stream para verlo crecer. */
+  A.md = function (target, text) {
+    var lines = String(text == null ? "" : text).replace(/\r/g, "").split("\n"),
+        frag = document.createDocumentFragment(), i = 0, l, el;
+    while (i < lines.length) {
+      l = lines[i];
+      if (/^```/.test(l)) {
+        var code = []; i++;
+        while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
+        i++;
+        var pre = document.createElement("pre"), c = document.createElement("code");
+        c.textContent = code.join("\n"); pre.appendChild(c); frag.appendChild(pre); continue;
+      }
+      var h = /^(#{1,4})\s+(.*)$/.exec(l);
+      if (h) { el = document.createElement("h" + (h[1].length + 1)); inline(el, h[2]); frag.appendChild(el); i++; continue; }
+      if (LIST.test(l)) {
+        el = document.createElement(/^\s*\d/.test(l) ? "ol" : "ul");
+        while (i < lines.length && LIST.test(lines[i])) {
+          var li = document.createElement("li"); inline(li, lines[i].replace(LIST, "")); el.appendChild(li); i++;
+        }
+        frag.appendChild(el); continue;
+      }
+      if (!l.trim()) { i++; continue; }
+      el = document.createElement("p");
+      var first = true;
+      while (i < lines.length && lines[i].trim() && !/^(```|#{1,4}\s)/.test(lines[i]) && !LIST.test(lines[i])) {
+        if (!first) el.appendChild(document.createElement("br"));
+        inline(el, lines[i++]); first = false;
+      }
+      frag.appendChild(el);
+    }
+    if (target) { target.replaceChildren(frag); return target; }
+    return frag;
+  };
+
   /** Texto ajeno listo para mostrar con textContent: sin caracteres de control ni de
    *  direccion (los que dan vuelta el texto), recortado. */
   A.clean = function (value, max) {

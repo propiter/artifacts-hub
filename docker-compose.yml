@@ -33,6 +33,12 @@ services:
       HUB_MAX_APP_PACKED: ${HUB_MAX_APP_PACKED:-12582912}
       HUB_MAX_APP_UNPACKED: ${HUB_MAX_APP_UNPACKED:-41943040}
       HUB_MAX_APP_FILES: ${HUB_MAX_APP_FILES:-1000}
+      # IA para las paginas. La clave NO se escribe aca ni en ningun archivo del repo: se carga
+      # en el entorno del servicio (Dokploy -> Environment) y el compose solo la referencia.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      HUB_AI_MODEL: ${HUB_AI_MODEL:-}
+      HUB_AI_MODELS: ${HUB_AI_MODELS:-}
     volumes:
       - hub-data:/data
       # las semillas del docroot (landing + 50x). El entrypoint las copia al volumen.

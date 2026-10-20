@@ -10,11 +10,30 @@ import assert from "node:assert/strict";
 const [, , snippetPath, base] = process.argv;
 const snippet = readFileSync(snippetPath, "utf8");
 
+// Un DOM minimo: lo justo para A.md (crear nodos, anidarlos, leerlos de vuelta). Si A.md
+// usara innerHTML, este DOM no lo interpretaria y el test lo veria.
+function miniDom() {
+  class Node {
+    constructor(tag, text) { this.tag = tag; this.children = []; this.attrs = {}; this._text = text ?? ""; }
+    appendChild(c) { if (c.tag === "#frag") this.children.push(...c.children); else this.children.push(c); return c; }
+    append(...cs) { cs.forEach(c => this.appendChild(c)); }
+    replaceChildren(...cs) { this.children = []; this.append(...cs); }
+    set textContent(v) { this.children = [new Node("#text", String(v))]; }
+    get textContent() { return this.tag === "#text" ? this._text : this.children.map(c => c.textContent).join(""); }
+    set innerHTML(v) { throw new Error("innerHTML usado"); }
+    set href(v) { this.attrs.href = v; } get href() { return this.attrs.href; }
+    set target(v) { this.attrs.target = v; } set rel(v) { this.attrs.rel = v; }
+    shape() { return this.tag === "#text" ? this._text : { [this.tag]: this.children.map(c => c.shape()) }; }
+  }
+  return { hidden: false, createElement: t => new Node(t), createTextNode: t => new Node("#text", t),
+           createDocumentFragment: () => new Node("#frag") };
+}
+
 function visitor({ key } = {}) {
   const store = new Map();
-  const doc = { hidden: false };
+  const doc = miniDom();
   const ctx = {
-    fetch, setTimeout, clearTimeout, console, crypto, TextEncoder, Promise, JSON, Math, Date,
+    fetch, setTimeout, clearTimeout, console, crypto, TextEncoder, TextDecoder, Promise, JSON, Math, Date,
     document: doc,
     localStorage: {
       getItem: k => (store.has(k) ? store.get(k) : null),
@@ -194,6 +213,60 @@ await scenario("errores con codigo: estado gigante y clave invalida", async () =
   const malo = visitor({ key: "art_" + "0".repeat(40) });
   await assert.rejects(malo.load(), e => e.status === 401 && e.code === "bad_key");
   await assert.rejects(A.save(5), e => e.code === "bad_change");
+});
+
+// ---------- IA (el hub de prueba apunta a un proveedor falso que contesta un eco) ----------
+await scenario("A.ai devuelve el texto", async () => {
+  const A = visitor();
+  assert.equal(await A.ai("hola mundo"), "**eco** (1): hola mundo");
+  assert.equal(await A.ai({ system: "Sos breve", prompt: "corto" }, { model: "modelo-chico" }), "**eco** (1): corto");
+});
+
+await scenario("A.ai.stream llega por pedazos y devuelve el total", async () => {
+  const A = visitor(), pieces = [];
+  const full = await A.ai.stream("uno dos tres cuatro", (t, sofar) => pieces.push(sofar));
+  assert.equal(full.trim(), "**eco** (1): uno dos tres cuatro");
+  assert.ok(pieces.length > 3, "llego todo junto: " + pieces.length);
+  assert.ok(pieces[0].length < pieces[pieces.length - 1].length);
+});
+
+await scenario("A.ai.json devuelve un objeto", async () => {
+  const o = await visitor().ai.json("armame un pitch con titulo y puntos");
+  assert.equal(o.eco, "armame un pitch con titulo y puntos");
+});
+
+await scenario("A.ai.chat recuerda la conversacion", async () => {
+  const c = visitor().ai.chat({ system: "Sos un asistente" });
+  assert.equal(await c.send("primero"), "**eco** (1): primero");
+  const out = await c.send("segundo", () => {});           // en vivo, con historial
+  assert.equal(out.trim(), "**eco** (2): segundo");
+  assert.equal(c.history.length, 4);
+  c.reset(); assert.equal(c.history.length, 0);
+});
+
+await scenario("errores de IA con codigo, y el chat no guarda el turno fallido", async () => {
+  const A = visitor();
+  await assert.rejects(A.ai("x", { model: "el-mas-caro" }), e => e.code === "bad_model" && e.status === 400);
+  await assert.rejects(A.ai(42), e => e.code === "bad_input");
+  const c = A.ai.chat({ model: "el-mas-caro" });
+  await assert.rejects(c.send("hola"), e => e.code === "bad_model");
+  assert.equal(c.history.length, 0);
+});
+
+await scenario("A.md arma DOM y deja el HTML ajeno como texto", async () => {
+  const A = visitor(), doc = A._doc;
+  const box = doc.createElement("div");
+  A.md(box, "# Titulo\n\nHola **mundo** y *algo* con `x()`\n\n- uno\n- dos\n\n1. a\n2. b\n\n```\ncodigo <b>\n```\n\n<img src=x onerror=alert(1)> [link](https://ejemplo.com) [malo](javascript:alert(1))");
+  const sh = box.shape().div;
+  assert.deepEqual(sh[0], { h2: ["Titulo"] });
+  assert.deepEqual(sh[1].p, ["Hola ", { strong: ["mundo"] }, " y ", { em: ["algo"] }, " con ", { code: ["x()"] }]);
+  assert.deepEqual(sh[2], { ul: [{ li: ["uno"] }, { li: ["dos"] }] });
+  assert.equal(Object.keys(sh[3])[0], "ol");
+  assert.deepEqual(sh[4], { pre: [{ code: ["codigo <b>"] }] });
+  const last = sh[5].p;
+  assert.equal(last[0], "<img src=x onerror=alert(1)> ", "el HTML no quedo como texto");
+  assert.equal(last[1].a[0], "link");
+  assert.ok(!JSON.stringify(sh).includes('"a":["malo"]'), "un link javascript: no puede ser link");
 });
 
 console.log(results.join("\n"));
