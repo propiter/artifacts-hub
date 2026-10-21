@@ -258,18 +258,36 @@ def embed(cfg, texts, kind):
     (los modelos e5 esperan ese prefijo)."""
     if not embeddings_on(cfg) or not texts:
         return None
+    # Lotes por TAMANO, no solo por cantidad: el proveedor limita el total de caracteres por
+    # pedido (gpthub: 32768), y 64 pasajes largos lo pasaban — los documentos grandes quedaban
+    # sin busqueda por significado.
+    budget = int(cfg.get("kb_embed_batch_chars") or 30000)
+    items = [kind + ": " + t[:2000] for t in texts]
+    batches, cur, size = [], [], 0
+    for it in items:
+        if cur and (len(cur) >= 64 or size + len(it) > budget):
+            batches.append(cur); cur, size = [], 0
+        cur.append(it); size += len(it)
+    if cur:
+        batches.append(cur)
     out = []
-    for i in range(0, len(texts), 64):
-        batch = [kind + ": " + t[:2000] for t in texts[i:i + 64]]
+    for batch in batches:
         req = urllib.request.Request(
             cfg["ai_base_url"].rstrip("/") + "/embeddings",
             data=json.dumps({"model": cfg["kb_embed_model"], "input": batch}).encode(),
             headers={"Authorization": "Bearer " + cfg["ai_key"], "Content-Type": "application/json"},
             method="POST")
-        try:
-            data = json.load(urllib.request.urlopen(req, timeout=cfg.get("ai_timeout", 120)))
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-            return None
+        data = None
+        for attempt in (1, 2):                       # un tropiezo del proveedor no deja el doc sin vectores
+            try:
+                data = json.load(urllib.request.urlopen(req, timeout=cfg.get("ai_timeout", 120)))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt == 2:
+                    return None
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                if attempt == 2:
+                    return None
         rows = sorted(data.get("data") or [], key=lambda d: d.get("index", 0))
         if len(rows) != len(batch):
             return None

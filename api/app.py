@@ -77,6 +77,7 @@ DEFAULTS = {
     "kb_max_doc_bytes": int(os.environ.get("HUB_KB_MAX_DOC_BYTES", 15 * 1024 * 1024)),
     "kb_max_chunks": int(os.environ.get("HUB_KB_MAX_CHUNKS", 60000)),   # por proyecto
     "kb_passages": int(os.environ.get("HUB_KB_PASSAGES", 6)),
+    "kb_embed_batch_chars": int(os.environ.get("HUB_KB_EMBED_BATCH_CHARS", 30000)),
     "kb_searches_per_hour": int(os.environ.get("HUB_KB_SEARCHES_PER_HOUR", 120)),
     # Secreto para derivar las claves de estado. Vacio = se genera y queda en settings.
     "state_key_secret": os.environ.get("HUB_STATE_SECRET", ""),
@@ -373,10 +374,11 @@ class Hub:
         digest = hub_kb.sha(data)
         with self.db() as c:
             pid = self.project_row(c, slug)["id"]
-            old = c.execute("SELECT id, sha256, visibility FROM docs WHERE project_id = ? AND path = ?",
+            old = c.execute("SELECT id, sha256, visibility, semantic FROM docs WHERE project_id = ? AND path = ?",
                             (pid, path)).fetchone()
         vis = visibility or (old["visibility"] if old else "internal")
-        if old and old["sha256"] == digest:
+        # mismo contenido: no-op... salvo que le falten los vectores y ahora se puedan calcular
+        if old and old["sha256"] == digest and (old["semantic"] or not hub_kb.embeddings_on(self.cfg)):
             if old["visibility"] != vis:
                 self.doc_visibility(ctx, slug, [path], vis)
                 return {"path": path, "status": "visibility", "visibility": vis}

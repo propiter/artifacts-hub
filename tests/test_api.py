@@ -1440,6 +1440,10 @@ class FakeAI:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 if self.path.endswith("/embeddings"):
                     import hashlib as _h, re as _re
+                    if sum(len(x) for x in body["input"]) > 32768:      # el limite real de gpthub
+                        raw = json.dumps({"error": {"message": "total input length exceeds the 32768 character limit"}}).encode()
+                        self.send_response(400); self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers(); self.wfile.write(raw); return
                     fake.embeds += len(body["input"])
                     data = []
                     for i, text in enumerate(body["input"]):
@@ -1822,6 +1826,25 @@ class TestProyectos(Base):
         self.assertEqual(s, 200, b)
         self.assertIn("999", self.fake.seen[-1]["body"]["messages"][0]["content"], "el equipo SI ve lo interno")
         self.assertEqual(b["sources"][0]["path"], "interno/precios.md")
+
+    def test_un_documento_grande_tiene_embeddings(self):
+        """El proveedor limita el total de caracteres por pedido: los lotes se arman por tamano."""
+        self.new_project()
+        big = "# Inventario\n\n" + "\n\n".join("Producto %d: llanta rin %d con garantia de %d meses y envio. " % (i, i % 20, i % 12) * 12
+                                                for i in range(120))
+        s, b = self.doc("zellia", "datos/inventario.md", big)
+        self.assertEqual(s, 200, b)
+        self.assertGreater(b["chunks"], 64)
+        self.assertTrue(b["semantic"], "un documento grande quedo sin busqueda por significado")
+
+    def test_resubir_repara_un_documento_sin_embeddings(self):
+        Handler.hub.cfg["kb_embed_model"] = ""
+        self.new_project()
+        self.assertFalse(self.doc("zellia", "docs/a.md", "# A\n\nalfa")[1]["semantic"])
+        Handler.hub.cfg["kb_embed_model"] = "emb-test"
+        s, b = self.doc("zellia", "docs/a.md", "# A\n\nalfa")
+        self.assertEqual((b["status"], b["semantic"]), ("updated", True), "mismo contenido sin embeddings: hay que reindexar")
+        self.assertEqual(self.doc("zellia", "docs/a.md", "# A\n\nalfa")[1]["status"], "unchanged")
 
     def test_sin_embeddings_busca_por_palabras(self):
         Handler.hub.cfg["kb_embed_model"] = ""
