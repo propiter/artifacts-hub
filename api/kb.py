@@ -20,6 +20,7 @@ import html.parser
 import io
 import json
 import math
+import operator
 import posixpath
 import re
 import subprocess
@@ -326,7 +327,7 @@ def search(conn, cfg, project_id, query, public_only, k=6, vectors=None):
             allowed = {r[0] for r in conn.execute(
                 "SELECT c.id FROM chunks c JOIN docs d ON d.id = c.doc_id"
                 " WHERE d.project_id = ? AND d.visibility = 'public'", (project_id,))}
-        dot = math.sumprod                       # 3.12+: ~2,4x mas rapido que sum(a*b for ...)
+        dot = _DOT
         scored = [(dot(qa, v), cid) for cid, v in vectors if allowed is None or cid in allowed]
         scored.sort(reverse=True)
         ranked.append([cid for s, cid in scored[:40] if s > 0.70])
@@ -342,6 +343,10 @@ def search(conn, cfg, project_id, query, public_only, k=6, vectors=None):
         " JOIN docs d ON d.id = c.doc_id WHERE c.id IN (%s)" % ",".join("?" * len(best)), best)}
     return [{"text": rows[c]["text"], "heading": rows[c]["heading"], "path": rows[c]["path"],
              "title": rows[c]["title"], "visibility": rows[c]["visibility"]} for c in best if c in rows]
+
+
+# math.sumprod (3.12+) es ~2,4x mas rapido; con 3.11 (soportada) se cae al equivalente.
+_DOT = getattr(math, "sumprod", None) or (lambda a, b: sum(map(operator.mul, a, b)))
 
 
 def load_vectors(conn, project_id):
