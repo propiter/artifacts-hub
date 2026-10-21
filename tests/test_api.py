@@ -1912,6 +1912,13 @@ class TestWebProyectos(Base):
         self.assertEqual(self.web("POST", "/proyectos", cookie=self.ck,
                                   data={"csrf": "malo", "slug": "otro", "title": "x"})[0], 403)
 
+    def test_hacer_publico_pide_confirmacion_y_dice_que_implica(self):
+        b = self.web("GET", "/p/zellia", cookie=self.ck)[2]
+        import re
+        form = re.search(r'<form method="post" action="/p/zellia/visibilidad"[^>]*>', b).group(0)
+        self.assertIn("confirm(", form, "hacer publico un documento no puede ser un clic sin aviso")
+        self.assertIn("cualquiera con el link", form)
+
     def test_visibilidad_y_sacar(self):
         c = self.csrf(self.web("GET", "/p/zellia", cookie=self.ck)[2])
         path = "docs/<b>raro</b>.md"

@@ -515,6 +515,14 @@ def page_projects(hub, session, projects, error=None):
       %s%s%s""" % (e, body, form), session=session, active="proyectos")
 
 
+# Hacer publico un documento lo pone al alcance de CUALQUIERA con el link de una pagina del
+# proyecto (preguntandole a su IA). Un clic suelto lo hacia sin decirlo: paso con un precio
+# cotizado a un cliente.
+_CONFIRM_PUBLIC = (' onsubmit="return confirm(\'Público = cualquiera con el link de una página de este proyecto '
+                   'puede preguntarle a su IA por este documento. Precios a clientes, reuniones y datos internos '
+                   'NO van públicos. ¿Hacerlo público?\')"')
+
+
 def page_project(hub, session, d):
     slug = d["slug"]
     arts = "".join(
@@ -528,14 +536,14 @@ def page_project(hub, session, d):
         rows.append(
             '<tr><td class="p">%s</td><td>%s</td><td><span class="vis %s">%s</span></td><td class="n">%d</td>'
             '<td style="white-space:nowrap">'
-            '<form method="post" action="/p/%s/visibilidad" style="display:inline">%s'
+            '<form method="post" action="/p/%s/visibilidad" style="display:inline"%s>%s'
             '<input type="hidden" name="path" value="%s"><input type="hidden" name="visibility" value="%s">'
             '<button class="btn" title="%s">%s</button></form> '
             '<form method="post" action="/p/%s/sacar" style="display:inline" '
             'onsubmit="return confirm(\'¿Sacar este documento del proyecto?\')">%s'
             '<input type="hidden" name="path" value="%s"><button class="btn">Sacar</button></form></td></tr>'
             % (esc(x["path"]), esc(x["title"]), "pub" if pub else "int", "público" if pub else "interno",
-               x["chunks"], esc(slug), _hidden_csrf(session), esc(x["path"]),
+               x["chunks"], esc(slug), "" if pub else _CONFIRM_PUBLIC, _hidden_csrf(session), esc(x["path"]),
                "internal" if pub else "public",
                "Solo el equipo y los agentes" if pub else "También la IA de las páginas (cualquiera con el link)",
                "Hacer interno" if pub else "Hacer público", esc(slug), _hidden_csrf(session), esc(x["path"])))
