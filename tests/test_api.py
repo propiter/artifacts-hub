@@ -1382,7 +1382,15 @@ class TestRuntime(Base):
         super().tearDown(); self.fake.close()
 
     def served_runtime(self):
-        self.pub(self.tok_ana, "juego")
+        # La pagina vive en un proyecto con un documento publico y uno interno: los escenarios
+        # de A.ask / A.docs prueban que la pagina ve SOLO el publico.
+        mk = lambda m, p, d, ct: self.req(m, p, token=self.tok_ana, data=d, ctype=ct)
+        mk("POST", "/api/v1/projects", json.dumps({"slug": "demo", "title": "Demo"}).encode(), "application/json")
+        mk("PUT", "/api/v1/projects/demo/docs?path=publico.md&visibility=public",
+           "# Horario\n\nLa tienda abre de lunes a viernes de 9 a 18.".encode(), "text/markdown")
+        mk("PUT", "/api/v1/projects/demo/docs?path=interno.md",
+           "# Margen\n\nEl margen interno de la tienda es 73 por ciento.".encode(), "text/markdown")
+        self.req("PUT", "/api/v1/artifacts/juego?project=demo", token=self.tok_ana, data=HTML)
         h = self.read(os.path.join(self.tmp, "a", "ana", "juego.html"))
         i = h.index(b"<!-- artifact-craft:runtime v2 -->")
         start = h.index(b"<script>", i) + len(b"<script>")
@@ -1411,7 +1419,7 @@ class TestRuntime(Base):
                            capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, "\n" + r.stdout + r.stderr)
         self.assertNotIn("FAIL", r.stdout)
-        self.assertGreaterEqual(r.stdout.count("ok   "), 24, r.stdout)
+        self.assertGreaterEqual(r.stdout.count("ok   "), 28, r.stdout)
 
 
 class FakeAI:
@@ -1422,7 +1430,7 @@ class FakeAI:
     def __init__(self, fail_with=None):
         import http.server
         fake = self
-        self.seen, self.fail_with = [], fail_with
+        self.seen, self.fail_with, self.embeds = [], fail_with, 0
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -1430,6 +1438,18 @@ class FakeAI:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                if self.path.endswith("/embeddings"):
+                    import hashlib as _h, re as _re
+                    fake.embeds += len(body["input"])
+                    data = []
+                    for i, text in enumerate(body["input"]):
+                        v = [0.0] * 64
+                        for w in _re.findall(r"\w+", text.lower().split(": ", 1)[-1]):
+                            v[int(_h.md5(w.encode()).hexdigest(), 16) % 64] += 1.0
+                        data.append({"index": i, "embedding": v})
+                    raw = json.dumps({"data": data}).encode()
+                    self.send_response(200); self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers(); self.wfile.write(raw); return
                 fake.seen.append({"auth": self.headers.get("Authorization"), "body": body,
                                   "path": self.path})
                 if fake.fail_with:
@@ -1458,7 +1478,7 @@ class FakeAI:
 
     def cfg(self):
         return {"ai_key": self.KEY, "ai_base_url": self.url, "ai_model": "modelo-bueno",
-                "ai_models": "modelo-chico"}
+                "ai_models": "modelo-chico", "kb_embed_model": "emb-test"}
 
     def close(self):
         self.srv.shutdown(); self.srv.server_close()
@@ -1569,7 +1589,8 @@ class TestIA(Base):
             s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None, headers={"X-Artifact-Key": self.key})
             self.assertEqual(s, 200, b)
         self.assertEqual(b, {"ok": True, "available": True, "model": "modelo-bueno",
-                             "models": ["modelo-bueno", "modelo-chico"], "per_visitor_hour": 3, "per_page_day": 5})
+                             "models": ["modelo-bueno", "modelo-chico"], "per_visitor_hour": 3, "per_page_day": 5,
+                             "project": None})
         self.assertEqual(self.ask({"prompt": "x"})[0], 200, "consultar info gasto cupo")
         self.assertNotIn(FakeAI.KEY, json.dumps(b))
         s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None)
@@ -1581,6 +1602,230 @@ class TestIA(Base):
         self.assertEqual((s, b["error"]), (503, "ai_off"))
         s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None, headers={"X-Artifact-Key": self.key})
         self.assertEqual((s, b["available"], b["models"]), (200, False, []))
+
+
+def make_pdf(text):
+    """Un PDF de una pagina con `text`, armado a mano (sin librerias): offsets xref reales."""
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R"
+            b" /Resources << /Font << /F1 5 0 R >> >> >>", None,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    stream = ("BT /F1 18 Tf 72 700 Td (%s) Tj ET" % text).encode("latin-1")
+    objs[3] = b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
+    out, offs = bytearray(b"%PDF-1.4\n"), []
+    for i, o in enumerate(objs, 1):
+        offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offs)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return bytes(out)
+
+
+def make_docx(paragraphs):
+    """Un .docx minimo de verdad (zip con word/document.xml), con un titulo."""
+    body = "".join('<w:p>%s<w:r><w:t>%s</w:t></w:r></w:p>' % (
+        '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>' if i == 0 else "", p) for i, p in enumerate(paragraphs))
+    buf = io.BytesIO()
+    with __import__("zipfile").ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", '<?xml version="1.0"?><w:document xmlns:w="x"><w:body>%s</w:body></w:document>' % body)
+    return buf.getvalue()
+
+
+class TestProyectos(Base):
+    """Un proyecto agrupa artifacts y documentos, y es de todo el equipo. Los documentos son
+    internos por defecto; la IA de una pagina solo ve los publicos de SU proyecto."""
+    overrides = {"ai_per_visitor_hour": 1000, "ai_per_page_day": 1000}
+
+    def setUp(self):
+        self.fake = FakeAI()
+        self.overrides = dict(self.overrides, **self.fake.cfg())
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown(); self.fake.close()
+
+    def jreq(self, method, path, body=None, token=None):
+        return self.req(method, path, token=token or self.tok_ana,
+                        data=None if body is None else json.dumps(body).encode(), ctype="application/json")
+
+    def doc(self, project, path, content, visibility=None, token=None):
+        qs = "path=" + urllib.parse.quote(path) + ("&visibility=" + visibility if visibility else "")
+        return self.req("PUT", "/api/v1/projects/%s/docs?%s" % (project, qs), token=token or self.tok_ana,
+                        data=content if isinstance(content, bytes) else content.encode(), ctype="application/octet-stream")
+
+    def new_project(self, slug="zellia"):
+        s, b = self.jreq("POST", "/api/v1/projects", {"slug": slug, "title": "Zellia", "description": "ventas"})
+        self.assertEqual(s, 201, b)
+        return b
+
+    PUBLICO = ("# Que es Zellia\n\nZellia es un sistema para vender por WhatsApp.\n\n"
+               "## Engage\n\nEngage atiende cada conversacion en segundos con agentes.\n")
+    INTERNO = "# Precios\n\nEl precio interno para Accorde es 999 por mes, no publicar.\n"
+
+    def test_crear_listar_y_es_de_todo_el_equipo(self):
+        self.new_project()
+        self.assertEqual(self.jreq("POST", "/api/v1/projects", {"slug": "zellia"})[0], 409)
+        self.assertEqual(self.jreq("POST", "/api/v1/projects", {"slug": "Mal Slug"})[0], 400)
+        s, b = self.jreq("GET", "/api/v1/projects", token=self.tok_beto)       # otro miembro lo ve
+        self.assertEqual([p["slug"] for p in b["projects"]], ["zellia"])
+        s, b = self.doc("zellia", "docs/beto.md", "# Nota\n\nBeto suma un documento.", token=self.tok_beto)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.jreq("GET", "/api/v1/projects/nada")[0], 404)
+
+    def test_documento_interno_por_defecto_idempotente_y_reindexa(self):
+        self.new_project()
+        s, b = self.doc("zellia", "docs/que-es.md", self.PUBLICO)
+        self.assertEqual((s, b["status"], b["visibility"], b["semantic"]), (200, "created", "internal", True), b)
+        self.assertGreaterEqual(b["chunks"], 1)
+        self.assertEqual(self.doc("zellia", "docs/que-es.md", self.PUBLICO)[1]["status"], "unchanged")
+        self.assertEqual(self.doc("zellia", "docs/que-es.md", self.PUBLICO + "\nMas.\n")[1]["status"], "updated")
+        s, b = self.doc("zellia", "docs/que-es.md", self.PUBLICO + "\nMas.\n", visibility="public")
+        self.assertEqual((b["status"], b["visibility"]), ("visibility", "public"))
+        d = self.jreq("GET", "/api/v1/projects/zellia")[1]
+        self.assertEqual([(x["path"], x["title"], x["visibility"]) for x in d["documents"]],
+                         [("docs/que-es.md", "Que es Zellia", "public")])
+
+    def test_rechaza_credenciales_sin_mostrarlas_y_no_guarda_nada(self):
+        self.new_project()
+        secreto = "sk-" + "A1b2" * 10
+        s, b = self.doc("zellia", "docs/env.md", "# Config\n\nnada\n\nOPENAI_API_KEY=" + secreto + "\n")
+        self.assertEqual((s, b["error"]), (422, "secrets"))
+        self.assertEqual(b["findings"][0]["line"], 5)
+        self.assertNotIn(secreto, json.dumps(b))
+        for leak in ("password: Hunter2025x", "postgres://admin:clave123@db:5432/x",
+                     "-----BEGIN RSA PRIVATE KEY-----", "token EAA" + "x1" * 40):
+            self.assertEqual(self.doc("zellia", "docs/x.md", "texto\n" + leak)[0], 422, leak)
+        self.assertEqual(self.doc("zellia", "docs/ok.md", "La contraseña: la que te dio Ana.")[0], 200,
+                         "una frase sin valor real no es una credencial")
+        self.assertEqual([x["path"] for x in self.jreq("GET", "/api/v1/projects/zellia")[1]["documents"]], ["docs/ok.md"])
+
+    def test_tipos_rutas_y_formatos(self):
+        self.new_project()
+        self.assertEqual(self.doc("zellia", "../fuera.md", "x")[0], 400)
+        self.assertEqual(self.doc("zellia", "planilla.xlsx", b"PK")[0], 415)
+        s, b = self.doc("zellia", "web/pagina.html",
+                        "<html><head><style>.x{}</style><script>alert(1)</script></head><body><h1>Landing</h1><p>Texto visible</p></body></html>")
+        self.assertEqual(s, 200, b)
+        s, b = self.doc("zellia", "contrato.docx", make_docx(["Contrato marco", "Clausula de datos del cliente"]))
+        self.assertEqual(s, 200, b)
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "clausula datos"})[1]["passages"]
+        self.assertEqual(r[0]["path"], "contrato.docx")
+        self.assertEqual(r[0]["title"], "Contrato marco")
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "visible landing"})[1]["passages"]
+        self.assertEqual(r[0]["path"], "web/pagina.html")
+        hits = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "alert"})[1]["passages"]
+        self.assertEqual([p for p in hits if p["path"] == "web/pagina.html"], [],
+                         "el script de un html no es contenido")
+
+    @unittest.skipUnless(shutil.which("pdftotext"), "sin pdftotext en esta maquina")
+    def test_pdf(self):
+        self.new_project()
+        s, b = self.doc("zellia", "folleto.pdf", make_pdf("Folleto comercial de Zellia Finance"))
+        self.assertEqual(s, 200, b)
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "folleto Finance"})[1]["passages"]
+        self.assertEqual(r[0]["path"], "folleto.pdf")
+        self.assertEqual(self.doc("zellia", "roto.pdf", b"%PDF-1.4 basura")[0], 422)
+
+    def test_busqueda_del_equipo_ve_todo_y_public_only_solo_lo_publico(self):
+        self.new_project()
+        self.doc("zellia", "publico/que-es.md", self.PUBLICO, visibility="public")
+        self.doc("zellia", "interno/precios.md", self.INTERNO)
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "precio Accorde"})[1]["passages"]
+        self.assertEqual(r[0]["path"], "interno/precios.md")
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "precio Accorde", "public_only": True})[1]["passages"]
+        self.assertTrue(all(p["visibility"] == "public" for p in r))
+        self.assertNotIn("999", json.dumps(r))
+
+    def test_publicar_en_un_proyecto_y_moverlo(self):
+        self.new_project()
+        s, b = self.req("PUT", "/api/v1/artifacts/pitch?project=zellia", token=self.tok_ana, data=HTML)
+        self.assertEqual((s, b.get("project")), (201, "zellia"), b)
+        s, b = self.req("PUT", "/api/v1/artifacts/otro?project=no-existe", token=self.tok_ana, data=HTML)
+        self.assertEqual(s, 404)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "a", "ana", "otro.html")),
+                         "publico aunque el proyecto no existia")
+        self.pub(self.tok_ana, "suelto")
+        self.assertEqual(self.jreq("PUT", "/api/v1/artifacts/suelto/project", {"project": "zellia"})[0], 200)
+        d = self.jreq("GET", "/api/v1/projects/zellia")[1]
+        self.assertEqual(sorted(a["slug"] for a in d["artifact_list"]), ["pitch", "suelto"])
+        self.assertEqual(self.jreq("PUT", "/api/v1/artifacts/suelto/project", {"project": None})[0], 200)
+        self.assertEqual(self.jreq("PUT", "/api/v1/artifacts/pitch/project", {"project": "zellia"},
+                                   token=self.tok_beto)[0], 404, "beto movio un artifact de ana")
+
+    def page_key(self, slug):
+        return self.req("GET", "/api/v1/artifacts/%s/key" % slug, token=self.tok_ana)[1]["key"]
+
+    def test_la_ia_de_la_pagina_responde_con_lo_publico_y_cita(self):
+        self.new_project()
+        self.doc("zellia", "publico/que-es.md", self.PUBLICO, visibility="public")
+        self.doc("zellia", "interno/precios.md", self.INTERNO)
+        self.req("PUT", "/api/v1/artifacts/pitch?project=zellia", token=self.tok_ana, data=HTML)
+        key = self.page_key("pitch")
+        s, b = self.req("POST", "/api/v1/ai/ana/pitch", ctype="application/json", headers={"X-Artifact-Key": key},
+                        data=json.dumps({"prompt": "¿que hace Engage? y el precio de Accorde", "knowledge": True}).encode())
+        self.assertEqual(s, 200, b)
+        system = self.fake.seen[-1]["body"]["messages"][0]["content"]
+        self.assertIn("Engage atiende cada conversacion", system)
+        self.assertNotIn("999", system, "un documento INTERNO llego a la IA de una pagina publica")
+        self.assertIn("DATOS", system)
+        self.assertEqual(b["sources"][0]["path"], "publico/que-es.md")
+        # busqueda directa desde la pagina: solo lo publico
+        s, b = self.req("POST", "/api/v1/kb/ana/pitch", ctype="application/json", headers={"X-Artifact-Key": key},
+                        data=json.dumps({"q": "precio Accorde 999"}).encode())
+        self.assertEqual(s, 200, b)
+        self.assertNotIn("999", json.dumps(b))
+        # info cuenta el proyecto
+        s, b = self.req("GET", "/api/v1/ai/ana/pitch", ctype=None, headers={"X-Artifact-Key": key})
+        self.assertEqual(b["project"], {"slug": "zellia", "title": "Zellia", "public_docs": 1})
+
+    def test_en_vivo_manda_primero_las_fuentes(self):
+        self.new_project()
+        self.doc("zellia", "publico/que-es.md", self.PUBLICO, visibility="public")
+        self.req("PUT", "/api/v1/artifacts/pitch?project=zellia", token=self.tok_ana, data=HTML)
+        r = urllib.request.Request(self.base + "/api/v1/ai/ana/pitch", method="POST",
+                                   data=json.dumps({"prompt": "Engage", "knowledge": True, "stream": True}).encode(),
+                                   headers={"Content-Type": "application/json", "X-Artifact-Key": self.page_key("pitch")})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            events = [json.loads(l[5:]) for l in resp.read().decode().split("\n\n") if l.startswith("data:")]
+        self.assertIn("sources", events[0])
+        self.assertEqual(events[-1], {"done": True})
+
+    def test_pagina_sin_proyecto_lo_dice(self):
+        self.pub(self.tok_ana, "suelta")
+        key = self.page_key("suelta")
+        s, b = self.req("POST", "/api/v1/ai/ana/suelta", ctype="application/json", headers={"X-Artifact-Key": key},
+                        data=json.dumps({"prompt": "x", "knowledge": True}).encode())
+        self.assertEqual((s, b["error"]), (409, "no_project"))
+        self.assertEqual(self.fake.seen, [])
+
+    def test_cambiar_visibilidad_y_borrar_por_carpeta(self):
+        self.new_project()
+        self.doc("zellia", "publico/a.md", "# A\n\nalfa unico")
+        self.doc("zellia", "publico/b.md", "# B\n\nbeta unico")
+        self.doc("zellia", "otro/c.md", "# C\n\ngamma unico")
+        s, b = self.jreq("PATCH", "/api/v1/projects/zellia/docs", {"prefix": "publico", "visibility": "public"})
+        self.assertEqual(sorted(b["changed"]), ["publico/a.md", "publico/b.md"])
+        s, b = self.jreq("DELETE", "/api/v1/projects/zellia/docs", {"prefix": "publico/"})
+        self.assertEqual(sorted(b["removed"]), ["publico/a.md", "publico/b.md"])
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "alfa unico"})[1]["passages"]
+        self.assertTrue(all(p["path"] == "otro/c.md" for p in r), "quedaron pasajes de un documento borrado")
+
+    def test_preguntar_al_proyecto_desde_el_agente(self):
+        self.new_project()
+        self.doc("zellia", "interno/precios.md", self.INTERNO)
+        s, b = self.jreq("POST", "/api/v1/projects/zellia/ask", {"q": "precio para Accorde"})
+        self.assertEqual(s, 200, b)
+        self.assertIn("999", self.fake.seen[-1]["body"]["messages"][0]["content"], "el equipo SI ve lo interno")
+        self.assertEqual(b["sources"][0]["path"], "interno/precios.md")
+
+    def test_sin_embeddings_busca_por_palabras(self):
+        Handler.hub.cfg["kb_embed_model"] = ""
+        self.new_project()
+        s, b = self.doc("zellia", "docs/a.md", "# A\n\nfacturacion electronica en Colombia")
+        self.assertEqual(b["semantic"], False)
+        r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "facturación"})[1]["passages"]
+        self.assertEqual(r[0]["path"], "docs/a.md", "FTS con acentos debe encontrar igual")
 
 
 if __name__ == "__main__":

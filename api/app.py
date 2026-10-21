@@ -28,6 +28,7 @@ from urllib.parse import urlparse, parse_qs
 import web as hub_web
 import meta as hub_meta
 import ai as hub_ai
+import kb as hub_kb
 
 MAX_BODY_HARD = 16 * 1024 * 1024
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
@@ -71,6 +72,12 @@ DEFAULTS = {
     "ai_max_messages": int(os.environ.get("HUB_AI_MAX_MESSAGES", 60)),
     "ai_tokens_param": os.environ.get("HUB_AI_TOKENS_PARAM", "max_tokens"),
     "ai_timeout": int(os.environ.get("HUB_AI_TIMEOUT", 120)),
+    # PROYECTOS y su conocimiento (kb.py). Embeddings del mismo proveedor que la IA.
+    "kb_embed_model": os.environ.get("HUB_KB_EMBED_MODEL", ""),
+    "kb_max_doc_bytes": int(os.environ.get("HUB_KB_MAX_DOC_BYTES", 15 * 1024 * 1024)),
+    "kb_max_chunks": int(os.environ.get("HUB_KB_MAX_CHUNKS", 60000)),   # por proyecto
+    "kb_passages": int(os.environ.get("HUB_KB_PASSAGES", 6)),
+    "kb_searches_per_hour": int(os.environ.get("HUB_KB_SEARCHES_PER_HOUR", 120)),
     # Secreto para derivar las claves de estado. Vacio = se genera y queda en settings.
     "state_key_secret": os.environ.get("HUB_STATE_SECRET", ""),
 }
@@ -260,6 +267,8 @@ class Hub:
         self.state_lock = threading.Lock()
         self.rate = {}
         self.attempts = {}
+        self.kb_lock = threading.Lock()
+        self._vectors = {}          # project_id -> (firma, [(chunk_id, vector)])
         os.makedirs(os.path.join(self.data, "a"), exist_ok=True)
         self._init_db()
 
@@ -292,6 +301,197 @@ class Hub:
             acols = {r["name"] for r in c.execute("PRAGMA table_info(artifacts)")}
             if "shared" not in acols:
                 c.execute("ALTER TABLE artifacts ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")
+            c.executescript(hub_kb.SCHEMA)
+            if "project_id" not in acols:
+                c.execute("ALTER TABLE artifacts ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+
+    # ---------- proyectos: artifacts + documentos, de todo el equipo ----------
+    def project_row(self, c, slug):
+        row = c.execute("SELECT * FROM projects WHERE slug = ?", (slug or "",)).fetchone()
+        if row is None:
+            raise ApiError(404, "no_project", "no existe el proyecto '%s' (wl-artifact projects lista los que hay)" % slug)
+        return row
+
+    def project_create(self, ctx, slug, title, description="", ip=None):
+        if not SLUG_RE.match(slug or ""):
+            raise ApiError(400, "bad_slug", "el proyecto debe ser [a-z0-9-], empezar con letra o numero, max 60")
+        title = (title or slug).strip()[:120]
+        with self.db() as c:
+            if c.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,)).fetchone():
+                raise ApiError(409, "exists", "ya existe el proyecto '%s'" % slug)
+            c.execute("INSERT INTO projects (slug, title, description, created_by, created_at, updated_at)"
+                      " VALUES (?,?,?,?,?,?)", (slug, title, (description or "").strip()[:500],
+                                                ctx["user_id"], now(), now()))
+        self.log("project", ctx["name"], ctx.get("prefix"), slug, None, ip, title)
+        return self.project_info(slug)
+
+    def project_update(self, ctx, slug, title=None, description=None):
+        with self.db() as c:
+            row = self.project_row(c, slug)
+            c.execute("UPDATE projects SET title = ?, description = ?, updated_at = ? WHERE id = ?",
+                      ((title or row["title"]).strip()[:120],
+                       (row["description"] if description is None else description).strip()[:500], now(), row["id"]))
+        return self.project_info(slug)
+
+    def projects(self):
+        with self.db() as c:
+            rows = c.execute(
+                "SELECT p.*, (SELECT COUNT(*) FROM artifacts a WHERE a.project_id = p.id AND a.deleted_at IS NULL) AS artifacts,"
+                " (SELECT COUNT(*) FROM docs d WHERE d.project_id = p.id) AS docs,"
+                " (SELECT COUNT(*) FROM docs d WHERE d.project_id = p.id AND d.visibility = 'public') AS public_docs"
+                " FROM projects p ORDER BY p.updated_at DESC").fetchall()
+        return [{"slug": r["slug"], "title": r["title"], "description": r["description"],
+                 "artifacts": r["artifacts"], "docs": r["docs"], "public_docs": r["public_docs"],
+                 "updated_at": r["updated_at"]} for r in rows]
+
+    def project_info(self, slug):
+        for p in self.projects():
+            if p["slug"] == slug:
+                return p
+        raise ApiError(404, "no_project", "no existe el proyecto '%s'" % slug)
+
+    def project_detail(self, slug):
+        info = self.project_info(slug)
+        with self.db() as c:
+            pid = self.project_row(c, slug)["id"]
+            docs = [dict(r) for r in c.execute(
+                "SELECT path, title, visibility, bytes, chars, chunks, semantic, updated_at FROM docs"
+                " WHERE project_id = ? ORDER BY path", (pid,))]
+            arts = [{"owner": r["owner"], "slug": r["slug"], "title": r["title"], "updated_at": r["updated_at"],
+                     "url": self.url_for(r["owner"], r["slug"] + ".html")} for r in c.execute(
+                "SELECT a.slug, a.title, a.updated_at, u.name AS owner FROM artifacts a JOIN users u ON u.id = a.user_id"
+                " WHERE a.project_id = ? AND a.deleted_at IS NULL ORDER BY a.updated_at DESC", (pid,))]
+        return dict(info, documents=docs, artifact_list=arts)
+
+    def doc_put(self, ctx, slug, path, data, visibility=None, ip=None):
+        """Indexa (o reindexa) un documento. Mismo contenido y misma visibilidad: no-op."""
+        path = self._kb(hub_kb.clean_path, path)
+        if visibility is not None and visibility not in hub_kb.VISIBILITY:
+            raise ApiError(400, "bad_visibility", "la visibilidad es internal o public")
+        if len(data) > self.cfg["kb_max_doc_bytes"]:
+            raise ApiError(413, "too_large", "el documento supera %d bytes" % self.cfg["kb_max_doc_bytes"])
+        digest = hub_kb.sha(data)
+        with self.db() as c:
+            pid = self.project_row(c, slug)["id"]
+            old = c.execute("SELECT id, sha256, visibility FROM docs WHERE project_id = ? AND path = ?",
+                            (pid, path)).fetchone()
+        vis = visibility or (old["visibility"] if old else "internal")
+        if old and old["sha256"] == digest:
+            if old["visibility"] != vis:
+                self.doc_visibility(ctx, slug, [path], vis)
+                return {"path": path, "status": "visibility", "visibility": vis}
+            return {"path": path, "status": "unchanged", "visibility": vis}
+        text = self._kb(hub_kb.extract, path, data)
+        if not text.strip():
+            raise ApiError(422, "empty", "no encontre texto en '%s'" % path)
+        leaks = hub_kb.scan_secrets(text)
+        if leaks:
+            raise ApiError(422, "secrets", "'%s' tiene algo con forma de credencial: no se indexa. Sacalo del"
+                           " documento (o rotalo si es real) y volve a subirlo" % path, {"findings": leaks, "path": path})
+        pieces = hub_kb.chunk(text)
+        vectors = hub_kb.embed(self.cfg, [(h + "\n" + t) if h else t for h, t in pieces], "passage")
+        with self.kb_lock, self.db() as c:
+            have = c.execute("SELECT COUNT(*) FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE d.project_id = ?"
+                             " AND d.path != ?", (pid, path)).fetchone()[0]
+            if have + len(pieces) > self.cfg["kb_max_chunks"]:
+                raise ApiError(413, "project_full", "el proyecto llego a su limite de %d pasajes" % self.cfg["kb_max_chunks"])
+            if old:
+                self._drop_chunks(c, old["id"])
+                c.execute("UPDATE docs SET title=?, visibility=?, bytes=?, chars=?, sha256=?, chunks=?, semantic=?,"
+                          " updated_at=? WHERE id=?", (hub_kb.title_of(path, text), vis, len(data), len(text), digest,
+                                                       len(pieces), 1 if vectors else 0, now(), old["id"]))
+                doc_id = old["id"]
+            else:
+                doc_id = c.execute(
+                    "INSERT INTO docs (project_id, path, title, visibility, bytes, chars, sha256, chunks, semantic,"
+                    " created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, path, hub_kb.title_of(path, text), vis, len(data), len(text), digest, len(pieces),
+                     1 if vectors else 0, ctx["user_id"], now(), now())).lastrowid
+            for i, (head, body) in enumerate(pieces):
+                cid = c.execute("INSERT INTO chunks (doc_id, ord, heading, text, vec) VALUES (?,?,?,?,?)",
+                                (doc_id, i, head, body, vectors[i] if vectors else None)).lastrowid
+                c.execute("INSERT INTO chunks_fts (text, heading, chunk_id) VALUES (?,?,?)", (body, head, cid))
+            c.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now(), pid))
+        self._vectors.pop(pid, None)
+        self.log("doc", ctx["name"], ctx.get("prefix"), slug, len(data), ip, "%s (%s)" % (path, vis))
+        return {"path": path, "status": "updated" if old else "created", "visibility": vis,
+                "chunks": len(pieces), "semantic": bool(vectors)}
+
+    def _drop_chunks(self, c, doc_id):
+        ids = [r[0] for r in c.execute("SELECT id FROM chunks WHERE doc_id = ?", (doc_id,))]
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            c.execute("DELETE FROM chunks_fts WHERE chunk_id IN (%s)" % ",".join("?" * len(part)), part)
+        c.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+
+    def _docs_matching(self, c, pid, paths=None, prefix=None):
+        if paths:
+            clean = [self._kb(hub_kb.clean_path, p) for p in paths]
+            return c.execute("SELECT id, path FROM docs WHERE project_id = ? AND path IN (%s)"
+                             % ",".join("?" * len(clean)), [pid] + clean).fetchall()
+        if prefix is not None:
+            pre = prefix.strip().lstrip("/")
+            return c.execute("SELECT id, path FROM docs WHERE project_id = ? AND (? = '' OR path = ? OR path LIKE ?)",
+                             (pid, pre, pre.rstrip("/"), pre.rstrip("/") + "/%")).fetchall()
+        raise ApiError(400, "bad_request", "indica paths o prefix")
+
+    def doc_visibility(self, ctx, slug, paths=None, visibility="internal", prefix=None, ip=None):
+        if visibility not in hub_kb.VISIBILITY:
+            raise ApiError(400, "bad_visibility", "la visibilidad es internal o public")
+        with self.db() as c:
+            pid = self.project_row(c, slug)["id"]
+            rows = self._docs_matching(c, pid, paths, prefix)
+            for r in rows:
+                c.execute("UPDATE docs SET visibility = ?, updated_at = ? WHERE id = ?", (visibility, now(), r["id"]))
+        self.log("doc-vis", ctx["name"], ctx.get("prefix"), slug, None, ip, "%d -> %s" % (len(rows), visibility))
+        return {"changed": [r["path"] for r in rows], "visibility": visibility}
+
+    def doc_delete(self, ctx, slug, paths=None, prefix=None, ip=None):
+        with self.kb_lock, self.db() as c:
+            pid = self.project_row(c, slug)["id"]
+            rows = self._docs_matching(c, pid, paths, prefix)
+            for r in rows:
+                self._drop_chunks(c, r["id"])
+                c.execute("DELETE FROM docs WHERE id = ?", (r["id"],))
+        self._vectors.pop(pid, None)
+        self.log("doc-rm", ctx["name"], ctx.get("prefix"), slug, None, ip, "%d documentos" % len(rows))
+        return {"removed": [r["path"] for r in rows]}
+
+    def kb_search(self, project_id, query, public_only, k=None):
+        k = max(1, min(int(k or self.cfg["kb_passages"]), 12))
+        with self.db() as c:
+            sig = c.execute("SELECT COUNT(*), COALESCE(MAX(c.id), 0) FROM chunks c JOIN docs d ON d.id = c.doc_id"
+                            " WHERE d.project_id = ? AND c.vec IS NOT NULL", (project_id,)).fetchone()
+            cached = self._vectors.get(project_id)
+            if not cached or cached[0] != tuple(sig):
+                cached = (tuple(sig), hub_kb.load_vectors(c, project_id))
+                self._vectors[project_id] = cached
+            return hub_kb.search(c, self.cfg, project_id, query, public_only, k, vectors=cached[1])
+
+    def project_of_artifact(self, owner, slug):
+        """(id, slug, title) del proyecto de un artifact, o None."""
+        with self.db() as c:
+            r = c.execute("SELECT p.id, p.slug, p.title FROM artifacts a JOIN users u ON u.id = a.user_id"
+                          " JOIN projects p ON p.id = a.project_id WHERE u.name = ? AND a.slug = ?"
+                          " AND a.deleted_at IS NULL", (owner, slug)).fetchone()
+        return tuple(r) if r else None
+
+    def set_artifact_project(self, ctx, slug, project, ip=None):
+        """Mete un artifact (propio, o cualquiera si sos admin) en un proyecto; None lo saca."""
+        row = self.mine_of(ctx, slug)
+        with self.db() as c:
+            pid = self.project_row(c, project)["id"] if project else None
+            c.execute("UPDATE artifacts SET project_id = ? WHERE id = ?", (pid, row["id"]))
+            if pid:
+                c.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now(), pid))
+        self.log("move", ctx["name"], ctx.get("prefix"), slug, None, ip, project or "(sin proyecto)")
+        return {"slug": slug, "project": project}
+
+    def _kb(self, fn, *a):
+        try:
+            return fn(*a)
+        except hub_kb.KbError as e:
+            raise ApiError(e.status, e.code, e.message, e.extra)
 
     def user_dir(self, name):
         d = os.path.join(self.data, "a", name)
@@ -1005,6 +1205,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _json_body(self):
+        try:
+            b = json.loads(self._body().decode("utf-8") or "{}")
+        except ValueError:
+            raise ApiError(400, "bad_json", "el cuerpo tiene que ser JSON")
+        if not isinstance(b, dict):
+            raise ApiError(400, "bad_json", "el cuerpo tiene que ser un objeto JSON")
+        return b
+
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
@@ -1051,17 +1260,42 @@ class Handler(BaseHTTPRequestHandler):
         if method != "HEAD" and body:
             self.wfile.write(body)
 
+    def _kb_with_key(self, owner, slug, key, ip):
+        hub = self.hub
+        try:
+            row = hub.check_artifact_key(owner, slug, key or "")
+            proj = hub.project_of_artifact(row["owner"], row["slug"])
+            if not proj:
+                raise ApiError(409, "no_project", "esta pagina no esta en un proyecto")
+            b = self._json_body()
+            query = (b.get("q") or "").strip()
+            if not query:
+                raise ApiError(400, "empty", "falta lo que se busca (q)")
+            hub.check_attempts("kbs:%s:%s" % (key[:32], ip), limit=hub.cfg["kb_searches_per_hour"], window=3600)
+            passages = hub.kb_search(proj[0], query, True, b.get("k"))
+            self._send(200, {"ok": True, "passages": [
+                {k: p[k] for k in ("title", "heading", "path", "text")} for p in passages]})
+        except ApiError as e:
+            self._err(e)
+
     def _ai_info(self, owner, slug, key):
         """Si la pagina tiene IA, con que modelos y que topes. No gasta cupo."""
         hub = self.hub
         try:
-            hub.check_artifact_key(owner, slug, key or "")
+            row = hub.check_artifact_key(owner, slug, key or "")
             on = hub_ai.enabled(hub.cfg)
+            proj = hub.project_of_artifact(row["owner"], row["slug"])
+            project = None
+            if proj:
+                project = {"slug": proj[1], "title": proj[2]}
+                with hub.db() as c:
+                    project["public_docs"] = c.execute(
+                        "SELECT COUNT(*) FROM docs WHERE project_id = ? AND visibility = 'public'", (proj[0],)).fetchone()[0]
             self._send(200, {"ok": True, "available": on,
                              "model": hub.cfg["ai_model"] if on else None,
                              "models": hub_ai.models(hub.cfg) if on else [],
                              "per_visitor_hour": hub.cfg["ai_per_visitor_hour"],
-                             "per_page_day": hub.cfg["ai_per_page_day"]})
+                             "per_page_day": hub.cfg["ai_per_page_day"], "project": project})
         except ApiError as e:
             self._err(e)
 
@@ -1075,6 +1309,18 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self._body().decode("utf-8") or "{}")
             except ValueError:
                 raise ApiError(400, "bad_json", "el pedido tiene que ser JSON")
+            sources = None
+            if isinstance(body, dict) and body.get("knowledge"):
+                proj = hub.project_of_artifact(row["owner"], row["slug"])
+                if not proj:
+                    raise ApiError(409, "no_project", "esta pagina no esta en un proyecto: no tiene documentos que consultar")
+                msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
+                users = [m.get("content") for m in msgs if isinstance(m, dict) and m.get("role") == "user"]
+                query = body.get("prompt") if isinstance(body.get("prompt"), str) and body.get("prompt").strip() else (users[-1] if users else "")
+                if isinstance(query, str) and query.strip():
+                    passages = hub.kb_search(proj[0], query[:2000], True)          # SOLO lo publico
+                    sources = hub_kb.sources_of(passages)
+                    body = dict(body, system=((body.get("system") or "") + "\n\n" + hub_kb.grounding(passages, proj[2])).strip())
             try:
                 payload, stream = hub_ai.build(hub.cfg, body)
             except hub_ai.AiError as e:
@@ -1083,8 +1329,10 @@ class Handler(BaseHTTPRequestHandler):
             hub.log("ai", row["owner"], None, row["slug"], None, ip, payload["model"])
             try:
                 if stream:
-                    return self._ai_stream(payload)
+                    return self._ai_stream(payload, sources)
                 out = hub_ai.complete(hub.cfg, payload)
+                if sources is not None:
+                    out["sources"] = sources
             except hub_ai.AiError as e:
                 raise ApiError(e.status, e.code, e.message)
             out["ok"] = True
@@ -1092,7 +1340,7 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             self._err(e)
 
-    def _ai_stream(self, payload):
+    def _ai_stream(self, payload, sources=None):
         """Respuesta en vivo: un evento SSE por pedazo de texto. Si el proveedor falla antes de
         empezar, es un error JSON normal; si falla en el medio, un evento {error}."""
         resp = hub_ai.open_stream(self.hub.cfg, payload)
@@ -1107,6 +1355,8 @@ class Handler(BaseHTTPRequestHandler):
             def event(obj):
                 self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
                 self.wfile.flush()
+            if sources is not None:
+                event({"sources": sources})
             try:
                 for piece in hub_ai.iter_stream(self.hub.cfg, resp):
                     event({"t": piece})
@@ -1161,6 +1411,11 @@ class Handler(BaseHTTPRequestHandler):
             art_key = self.headers.get("X-Artifact-Key")
             if art_key and len(rest) == 3 and rest[0] == "state":
                 return self._state_with_key(method, rest[1], rest[2], art_key, ip)
+            # CONOCIMIENTO por CLAVE DE ARTIFACT: los pasajes PUBLICOS del proyecto de la pagina.
+            if len(rest) == 3 and rest[0] == "kb":
+                if method != "POST":
+                    raise ApiError(405, "method_not_allowed", "se busca con POST")
+                return self._kb_with_key(rest[1], rest[2], art_key, ip)
             # IA por CLAVE DE ARTIFACT: la pagina pide, el hub llama al proveedor con SU clave.
             if len(rest) == 3 and rest[0] == "ai":
                 if method == "GET":
@@ -1185,8 +1440,14 @@ class Handler(BaseHTTPRequestHandler):
                 route = "one"
             elif len(rest) == 2 and rest[0] == "apps":
                 route = "app"
-            elif len(rest) == 3 and rest[0] == "artifacts" and rest[2] in ("thumb", "key"):
-                route = rest[2]
+            elif len(rest) == 3 and rest[0] == "artifacts" and rest[2] in ("thumb", "key", "project"):
+                route = "artifact-project" if rest[2] == "project" else rest[2]
+            elif rest == ["projects"]:
+                route = "projects"
+            elif len(rest) == 2 and rest[0] == "projects":
+                route = "project"
+            elif len(rest) == 3 and rest[0] == "projects" and rest[2] in ("docs", "ask", "search"):
+                route = "project-" + rest[2]
             elif len(rest) == 3 and rest[0] == "state":
                 route = "state"
             else:
@@ -1232,10 +1493,77 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(415, "bad_type",
                                    "una app se sube como tar.gz (Content-Type: application/gzip); recibi '%s'" % (ctype or "vacio"))
                 body = self._body()
+                project = (q.get("project") or [None])[0]
+                if project:
+                    with hub.db() as c:
+                        hub.project_row(c, project)
                 r = hub.deploy_app(ctx, rest[1], body, ip)
+                if project:
+                    hub.set_artifact_project(ctx, r["slug"], project, ip)
+                    r["project"] = project
                 return self._send(200 if r["unchanged"] else 201,
                                   {"ok": True, "url": hub.url_for(ctx["name"], r["slug"] + "/"),
                                    "thumb_url": hub.thumb_url(ctx["name"], r["slug"]), **r})
+
+            if route == "projects":
+                if method == "GET":
+                    return self._send(200, {"ok": True, "projects": hub.projects()})
+                if method == "POST":
+                    b = self._json_body()
+                    return self._send(201, {"ok": True, **hub.project_create(
+                        ctx, (b.get("slug") or "").strip().lower(), b.get("title"), b.get("description"), ip)})
+                raise ApiError(405, "method_not_allowed", "los proyectos se listan con GET y se crean con POST")
+
+            if route == "project":
+                if method == "GET":
+                    return self._send(200, {"ok": True, **hub.project_detail(rest[1])})
+                if method == "PATCH":
+                    b = self._json_body()
+                    return self._send(200, {"ok": True, **hub.project_update(ctx, rest[1], b.get("title"), b.get("description"))})
+                raise ApiError(405, "method_not_allowed", "un proyecto se lee con GET y se edita con PATCH")
+
+            if route == "project-docs":
+                if method == "PUT":
+                    path = (q.get("path") or [""])[0]
+                    vis = (q.get("visibility") or [None])[0]
+                    return self._send(200, {"ok": True, **hub.doc_put(ctx, rest[1], path, self._body(), vis, ip)})
+                if method == "PATCH":
+                    b = self._json_body()
+                    return self._send(200, {"ok": True, **hub.doc_visibility(
+                        ctx, rest[1], b.get("paths"), b.get("visibility"), b.get("prefix"), ip)})
+                if method == "DELETE":
+                    b = self._json_body()
+                    return self._send(200, {"ok": True, **hub.doc_delete(ctx, rest[1], b.get("paths"), b.get("prefix"), ip)})
+                raise ApiError(405, "method_not_allowed", "documentos: PUT sube, PATCH cambia visibilidad, DELETE borra")
+
+            if route in ("project-search", "project-ask"):
+                if method != "POST":
+                    raise ApiError(405, "method_not_allowed", "se consulta con POST")
+                b = self._json_body()
+                query = (b.get("q") or "").strip()
+                if not query:
+                    raise ApiError(400, "empty", "falta la pregunta (q)")
+                hub.check_rate(ctx["token_id"])
+                with hub.db() as c:
+                    prow = hub.project_row(c, rest[1])
+                passages = hub.kb_search(prow["id"], query, bool(b.get("public_only")), b.get("k"))
+                if route == "project-search":
+                    return self._send(200, {"ok": True, "passages": passages})
+                if not hub_ai.enabled(hub.cfg):
+                    raise ApiError(503, "ai_off", "este hub no tiene IA configurada")
+                try:
+                    payload, _ = hub_ai.build(hub.cfg, {"system": hub_kb.grounding(passages, prow["title"]),
+                                                        "prompt": query, "model": b.get("model")})
+                    out = hub_ai.complete(hub.cfg, payload)
+                except hub_ai.AiError as e:
+                    raise ApiError(e.status, e.code, e.message)
+                return self._send(200, {"ok": True, "text": out["text"], "sources": hub_kb.sources_of(passages)})
+
+            if route == "artifact-project":
+                if method != "PUT":
+                    raise ApiError(405, "method_not_allowed", "el proyecto de un artifact se cambia con PUT")
+                b = self._json_body()
+                return self._send(200, {"ok": True, **hub.set_artifact_project(ctx, rest[1], b.get("project") or None, ip)})
 
             if route == "thumb":
                 slug = rest[1]
@@ -1291,7 +1619,14 @@ class Handler(BaseHTTPRequestHandler):
                     title = self.headers.get("X-Artifact-Title")
                     if title and (len(title) > 200 or not title.isascii()):
                         title = None
+                    project = (q.get("project") or [None])[0]
+                    if project:
+                        with hub.db() as c:
+                            hub.project_row(c, project)          # que exista ANTES de publicar
                     r = hub.publish(ctx, rest[1], body, title or extract_title(body), ip)
+                    if project:
+                        hub.set_artifact_project(ctx, r["slug"], project, ip)
+                        r["project"] = project
                     return self._send(200 if r["unchanged"] else 201,
                                       {"ok": True, "url": hub.url_for(ctx["name"], r["name"]),
                                        "snapshot_url": hub.url_for(ctx["name"], r["snapshot"]) if r.get("snapshot") else None,
@@ -1325,6 +1660,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._handle("DELETE")
+
+    def do_PATCH(self):
+        self._handle("PATCH")
 
 
 def build_server(cfg):

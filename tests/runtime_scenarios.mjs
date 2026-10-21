@@ -275,5 +275,37 @@ await scenario("A.md arma DOM y deja el HTML ajeno como texto", async () => {
   assert.ok(!JSON.stringify(sh).includes('"a":["malo"]'), "un link javascript: no puede ser link");
 });
 
+// ---------- conocimiento del proyecto: la pagina esta en "demo" (un doc publico, uno interno) ----------
+await scenario("A.ask responde con los documentos publicos y cita", async () => {
+  const r = await visitor().ask("¿en que horario abre la tienda? ¿y el margen?");
+  assert.match(r.text, /eco/);
+  assert.equal(r.sources[0].path, "publico.md");
+  assert.ok(!JSON.stringify(r).includes("73"), "un documento interno llego a la pagina");
+});
+
+await scenario("A.ask en vivo trae las fuentes y el texto por pedazos", async () => {
+  const pieces = [];
+  const r = await visitor().ask("horario de la tienda", { onText: (t, s) => pieces.push(s) });
+  assert.ok(pieces.length > 1);
+  assert.equal(r.sources[0].path, "publico.md");
+  assert.equal(r.text, pieces[pieces.length - 1]);
+});
+
+await scenario("A.docs.search devuelve pasajes publicos, sin IA", async () => {
+  const p = await visitor().docs.search("margen tienda horario");
+  assert.ok(p.length >= 1);
+  assert.ok(p.every(x => x.path === "publico.md"), JSON.stringify(p));
+  assert.ok("text" in p[0] && "title" in p[0]);
+});
+
+await scenario("A.ai.chat con knowledge guarda las fuentes de la ultima respuesta", async () => {
+  const c = visitor().ai.chat({ system: "Sos el asistente de la tienda", knowledge: true });
+  await c.send("¿abren los lunes?");
+  assert.equal(c.sources[0].path, "publico.md");
+  await c.send("¿y el horario de la tienda los viernes?", () => {});
+  assert.equal(c.sources[0].path, "publico.md");
+  assert.equal(c.history.length, 4);
+});
+
 console.log(results.join("\n"));
 process.exit(results.some(r => r.startsWith("FAIL")) ? 1 : 0);

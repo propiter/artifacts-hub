@@ -41,6 +41,8 @@ services:
       # buena calidad); gpt-6-sol = el que una pagina puede pedir para algo mas exigente.
       HUB_AI_MODEL: ${HUB_AI_MODEL:-gpt-6-luna}
       HUB_AI_MODELS: ${HUB_AI_MODELS:-gpt-6-sol}
+      # Proyectos: con que modelo se buscan los documentos por significado. Sin el, por palabras.
+      HUB_KB_EMBED_MODEL: ${HUB_KB_EMBED_MODEL:-Xenova/multilingual-e5-small}
     volumes:
       - hub-data:/data
       # las semillas del docroot (landing + 50x). El entrypoint las copia al volumen.

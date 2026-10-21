@@ -1,7 +1,8 @@
 # La API no necesita nada fuera de la stdlib de Python: no hay requirements.
 FROM python:3.13-alpine
 
-RUN apk add --no-cache su-exec
+# poppler-utils: pdftotext, para indexar los PDF de un proyecto (kb.py).
+RUN apk add --no-cache su-exec poppler-utils
 
 WORKDIR /app
 # *.py y no una lista: con la lista, un modulo nuevo (meta.py) pasaba todos los tests —corren

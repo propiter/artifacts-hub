@@ -109,6 +109,17 @@ jobs:
           [ "$code" = "201" ] || [ "$code" = "200" ] || { echo "publicar dio $code"; cat /tmp/r.json; docker logs hub; exit 1; }
           grep -q 'window.ARTIFACT=' "$D/a/ci/imagen.html" || { echo "la imagen no inyecta el runtime"; exit 1; }
           grep -q 'A.save = async function' "$D/a/ci/imagen.html" || { echo "la imagen no lleva runtime.js"; exit 1; }
+          # Un proyecto con un PDF: la imagen tiene que traer kb.py, FTS5 y pdftotext.
+          curl -sf -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+            -d '{"slug":"ci","title":"CI"}' http://127.0.0.1:18090/api/v1/projects >/dev/null \
+            || { echo "no pude crear un proyecto"; docker logs hub; exit 1; }
+          python3 -c 'import sys; sys.path.insert(0, "tests"); from test_api import make_pdf; sys.stdout.buffer.write(make_pdf("Folleto de prueba del pipeline"))' > /tmp/f.pdf
+          code=$(curl -s -o /tmp/r.json -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOK" \
+                   --data-binary @/tmp/f.pdf "http://127.0.0.1:18090/api/v1/projects/ci/docs?path=f.pdf")
+          [ "$code" = "200" ] || { echo "indexar un PDF dio $code"; cat /tmp/r.json; exit 1; }
+          curl -sf -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+            -d '{"q":"folleto pipeline"}' http://127.0.0.1:18090/api/v1/projects/ci/search | grep -q '"f.pdf"' \
+            || { echo "la imagen no encuentra lo que indexo"; exit 1; }
           echo "imagen OK"
 
   # La base vive en el MISMO volumen que nginx sirve como docroot. Sin una lista blanca, la

@@ -264,8 +264,11 @@
   /** Igual, pero llega en vivo: onText(pedazo, textoHastaAhora) por cada pedazo. Devuelve el
    *  texto completo. Para que el visitante vea la respuesta escribirse. */
   A.ai.stream = async function (input, onText, opts) {
-    var body = aiBody(input, opts); body.stream = true;
-    var r = await aiPost(body), full = "", buf = "";
+    return (await streamPost(aiBody(input, opts), onText)).text;
+  };
+  async function streamPost(body, onText) {
+    body.stream = true;
+    var r = await aiPost(body), full = "", buf = "", sources = null;
     function handle(chunk) {
       buf += chunk;
       var parts = buf.split("\n\n"); buf = parts.pop();
@@ -273,6 +276,7 @@
         if (p.indexOf("data:") !== 0) return;
         var ev; try { ev = JSON.parse(p.slice(5)); } catch (e) { return; }
         if (ev.error) throw fail(502, ev.error, ev.message);
+        if (ev.sources) sources = ev.sources;
         if (ev.t) { full += ev.t; if (onText) onText(ev.t, full); }
       });
     }
@@ -281,8 +285,8 @@
       for (;;) { var x = await reader.read(); if (x.done) break; handle(dec.decode(x.value, { stream: true })); }
     } else handle(await r.text());
     handle("\n\n");
-    return full;
-  };
+    return { text: full, sources: sources };
+  }
   /** {available, model, models, per_visitor_hour, per_page_day}: si esta pagina tiene IA y con
    *  que modelos. No gasta cupo. Para mostrar "IA no disponible" antes de que el visitante escriba. */
   A.ai.info = async function () {
@@ -304,19 +308,46 @@
     var o = opts || {}, hist = [];
     return {
       history: hist,
+      sources: [],
       send: async function (text, onText) {
         hist.push({ role: "user", content: String(text) });
-        var input = { system: o.system, messages: hist.slice(-(o.keep || 20)) };
-        var extra = { model: o.model, max_tokens: o.max_tokens, temperature: o.temperature };
-        Object.keys(extra).forEach(function (k) { if (extra[k] === undefined) delete extra[k]; });
+        var body = aiBody({ system: o.system, messages: hist.slice(-(o.keep || 20)) },
+          { model: o.model, max_tokens: o.max_tokens, temperature: o.temperature, knowledge: o.knowledge || undefined });
+        Object.keys(body).forEach(function (k) { if (body[k] === undefined) delete body[k]; });
         try {
-          var out = onText ? await A.ai.stream(input, onText, extra) : await A.ai(input, extra);
-          hist.push({ role: "assistant", content: out });
-          return out;
+          var out = onText ? await streamPost(body, onText) : await (await aiPost(body)).json();
+          hist.push({ role: "assistant", content: out.text || "" });
+          this.sources = out.sources || [];
+          return out.text || "";
         } catch (e) { hist.pop(); throw e; }
       },
-      reset: function () { hist.length = 0; }
+      reset: function () { hist.length = 0; this.sources = []; }
     };
+  };
+
+  // ---------- lo que sabe el PROYECTO de la pagina (solo sus documentos publicos) ----------
+  /** Responde con los documentos del proyecto y dice de donde lo saco:
+   *  {text, sources: [{n, title, path, heading, excerpt}]}. `opts.onText` para verla escribirse;
+   *  `opts.system` para el tono o el formato. Si no esta en los documentos, lo dice. */
+  A.ask = async function (question, opts) {
+    var o = opts || {}, body = aiBody(String(question), { system: o.system, model: o.model, knowledge: true });
+    if (body.system === undefined) delete body.system;
+    if (body.model === undefined) delete body.model;
+    if (o.onText) return streamPost(body, o.onText);
+    var b = await (await aiPost(body)).json();
+    return { text: b.text || "", sources: b.sources || [] };
+  };
+  /** Los pasajes crudos de los documentos publicos: [{title, heading, path, text}]. Sin IA y
+   *  sin gastar su cupo: para un buscador, un FAQ, o para armar tu propio prompt. */
+  A.docs = {
+    search: async function (q, k) {
+      var r = await fetch(A.api + "/api/v1/kb/" + encodeURIComponent(A.owner) + "/" + encodeURIComponent(A.slug), {
+        method: "POST", cache: "no-store", body: JSON.stringify({ q: String(q), k: k }),
+        headers: { "X-Artifact-Key": A.key, "Content-Type": "application/json" } });
+      var b = await json(r);
+      if (!r.ok) throw fail(r.status, b.error || "http_" + r.status, b.message);
+      return b.passages || [];
+    }
   };
 
   // ---------- markdown seguro: lo que escribe una IA, como DOM y nunca como HTML ----------
