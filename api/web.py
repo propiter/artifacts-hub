@@ -284,6 +284,32 @@ tr:last-child td{border-bottom:0}
 label{display:block;font-size:13px;color:var(--muted);margin:12px 0 5px}
 .err{background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.35);border-radius:10px;padding:11px 13px;font-size:13.5px;margin:0 0 14px}
 
+  .pgrid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));margin-bottom:26px}
+  .pcard{display:block;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;
+    box-shadow:var(--shadow);color:var(--fg);text-decoration:none}
+  .pcard:hover{border-color:var(--accent)}
+  .pcard b{display:block;font-size:15.5px;letter-spacing:-.01em;margin-bottom:4px}
+  .pcard span{display:block;color:var(--muted);font-size:13px}
+  .sec{margin:30px 0 0}.sec h3{font-size:16px;margin:0 0 4px}.sec>p{color:var(--muted);font-size:13.5px;margin:0 0 12px}
+  .ask{display:flex;gap:8px;flex-wrap:wrap}
+  .ask input{flex:1 1 260px}
+  .answer{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-top:12px;font-size:14.5px}
+  .answer:empty{display:none}
+  .srcs{margin:8px 0 0;padding-left:18px;color:var(--muted);font-size:12.5px}
+  .vis{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;padding:3px 7px;border-radius:6px;font-weight:700}
+  .vis.pub{background:rgba(16,185,129,.15);color:#0f8a5f}.vis.int{background:var(--chip);color:var(--muted)}
+  .drop{border:1.5px dashed var(--line);border-radius:12px;padding:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card)}
+  .drop.on{border-color:var(--accent)}
+  .log{font:12.5px/1.6 ui-monospace,Menlo,monospace;color:var(--muted);margin-top:8px;white-space:pre-wrap}
+  .tbl td.p{font:12.5px ui-monospace,Menlo,monospace;word-break:break-all}
+  @media(max-width:700px){.tbl thead{display:none}.tbl table,.tbl tbody,.tbl tr,.tbl td{display:block;width:100%}
+    .tbl tr{border-bottom:1px solid var(--line);padding:10px 13px}.tbl td{border:0;padding:3px 0}
+    .tbl td.n:before{content:"Pasajes: ";color:var(--muted)}}
+  .box input[type=text]{width:100%}
+  .answer p{margin:0 0 8px}.answer p:last-child{margin:0}.answer ul{margin:0 0 8px;padding-left:20px}
+  .arts{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+  .art{display:flex;justify-content:space-between;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:11px 13px;font-size:13.5px}
+  .art span{min-width:0;overflow-wrap:anywhere}
   .sharebar {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
     background: var(--card); border: 1px solid var(--line); border-radius: 12px;
@@ -298,7 +324,8 @@ label{display:block;font-size:13px;color:var(--muted);margin:12px 0 5px}
 def layout(title, body, session=None, cfg=None, active=""):
     who = ""
     if session:
-        tabs = [("galeria", "Mi galería", "/"), ("equipo", "Del equipo", "/equipo")]
+        tabs = [("galeria", "Mi galería", "/"), ("proyectos", "Proyectos", "/proyectos"),
+                ("equipo", "Del equipo", "/equipo")]
         if session["is_admin"]:
             tabs.append(("admin", "Administración", "/admin"))
         nav = "".join(
@@ -455,6 +482,135 @@ def page_team(hub, session, spaces):
       %s""" % body, session=session, active="equipo")
 
 
+def _hidden_csrf(session):
+    return '<input type="hidden" name="csrf" value="%s">' % esc(session.get("_csrf", ""))
+
+
+def page_projects(hub, session, projects, error=None):
+    e = '<div class="err">%s</div>' % esc(error) if error else ""
+    if projects:
+        cards = "".join(
+            '<a class="pcard" href="/p/%s"><b>%s</b><span>%s</span>'
+            '<span style="margin-top:8px">%d artifacts · %d documentos (%d públicos) · %s</span></a>'
+            % (esc(p["slug"]), esc(p["title"]), esc(p["description"] or p["slug"]),
+               p["artifacts"], p["docs"], p["public_docs"], esc(fmt_rel(p["updated_at"])))
+            for p in projects)
+        body = '<div class="pgrid">%s</div>' % cards
+    else:
+        body = ('<div class="empty" style="margin-bottom:26px">Todavía no hay proyectos.<br><br>'
+                'Un proyecto junta las páginas y los documentos de un tema (un cliente, un producto),'
+                ' y la IA de sus páginas responde con esos documentos.</div>')
+    form = ('<div class="box"><h3>Nuevo proyecto</h3><p>Lo ve y lo usa todo el equipo.</p>'
+            '<form method="post" action="/proyectos">%s'
+            '<label>Nombre corto (va en los comandos)</label><input type="text" name="slug" required '
+            'pattern="[a-z0-9][a-z0-9-]{0,60}" placeholder="zellia">'
+            '<label>Título</label><input type="text" name="title" required placeholder="Zellia — ecosistema y ventas">'
+            '<label>De qué se trata</label><input type="text" name="description" placeholder="opcional">'
+            '<div style="margin-top:14px"><button class="btn p">Crear</button></div></form></div>'
+            % _hidden_csrf(session))
+    return layout("Proyectos", """
+      <h2>Proyectos</h2>
+      <p class="sub">Páginas y documentos de un mismo tema, de todo el equipo. Los agentes los usan
+        solos: si pedís algo sobre un tema con proyecto, publican ahí y consultan sus documentos.</p>
+      %s%s%s""" % (e, body, form), session=session, active="proyectos")
+
+
+def page_project(hub, session, d):
+    slug = d["slug"]
+    arts = "".join(
+        '<div class="art"><span><b>%s</b><br><span class="file">%s · %s</span></span>'
+        '<a class="btn p" href="%s" target="_blank" rel="noreferrer">Abrir</a></div>'
+        % (esc(a["title"] or a["slug"]), esc(a["owner"]), esc(a["slug"]), esc(a["url"]))
+        for a in d["artifact_list"]) or '<div class="empty" style="padding:24px">Sin páginas todavía.</div>'
+    rows = []
+    for x in d["documents"]:
+        pub = x["visibility"] == "public"
+        rows.append(
+            '<tr><td class="p">%s</td><td>%s</td><td><span class="vis %s">%s</span></td><td class="n">%d</td>'
+            '<td style="white-space:nowrap">'
+            '<form method="post" action="/p/%s/visibilidad" style="display:inline">%s'
+            '<input type="hidden" name="path" value="%s"><input type="hidden" name="visibility" value="%s">'
+            '<button class="btn" title="%s">%s</button></form> '
+            '<form method="post" action="/p/%s/sacar" style="display:inline" '
+            'onsubmit="return confirm(\'¿Sacar este documento del proyecto?\')">%s'
+            '<input type="hidden" name="path" value="%s"><button class="btn">Sacar</button></form></td></tr>'
+            % (esc(x["path"]), esc(x["title"]), "pub" if pub else "int", "público" if pub else "interno",
+               x["chunks"], esc(slug), _hidden_csrf(session), esc(x["path"]),
+               "internal" if pub else "public",
+               "Solo el equipo y los agentes" if pub else "También la IA de las páginas (cualquiera con el link)",
+               "Hacer interno" if pub else "Hacer público", esc(slug), _hidden_csrf(session), esc(x["path"])))
+    table = ('<div class="tbl"><table><thead><tr><th>Documento</th><th>Título</th><th>Quién lo ve</th>'
+             '<th>Pasajes</th><th></th></tr></thead><tbody>%s</tbody></table></div>' % "".join(rows)
+             if rows else '<div class="empty" style="padding:24px">Sin documentos todavía.</div>')
+    body = """
+      <p class="sub" style="margin:0 0 4px"><a href="/proyectos" style="color:inherit">← Proyectos</a></p>
+      <h2>%(title)s</h2>
+      <p class="sub">%(desc)s · %(nd)d documentos (%(np)d públicos) · <code>%(slug)s</code></p>
+
+      <div class="sec"><h3>Preguntale al proyecto</h3>
+        <p>Responde con TODOS sus documentos, internos incluidos, y dice de dónde lo sacó.</p>
+        <form class="ask" id="ask">%(csrf)s<input type="text" name="q" required placeholder="¿Qué se decidió sobre precios?">
+          <button class="btn p">Preguntar</button></form>
+        <div class="answer" id="answer" aria-live="polite"></div><ol class="srcs" id="srcs"></ol></div>
+
+      <div class="sec"><h3>Páginas</h3><p>Su IA consulta solo los documentos públicos.</p>
+        <div class="arts">%(arts)s</div></div>
+
+      <div class="sec"><h3>Documentos</h3>
+        <p><b>Interno</b>: lo consultan el equipo y los agentes. <b>Público</b>: además, la IA de las páginas,
+          o sea cualquiera con el link. Un archivo con contraseñas o tokens se rechaza.</p>
+        <div class="drop" id="drop"><input type="file" id="files" multiple
+          accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.rst,.html,.htm,.pdf,.docx">
+          <label style="margin:0;display:flex;gap:6px;align-items:center"><input type="checkbox" id="pub"> públicos</label>
+          <button class="btn p" id="up" type="button">Subir</button></div>
+        <div class="log" id="log"></div>
+        <div style="margin-top:14px">%(table)s</div></div>
+    """ % {"title": esc(d["title"]), "desc": esc(d["description"] or "Proyecto del equipo"),
+           "nd": d["docs"], "np": d["public_docs"], "slug": esc(slug), "csrf": _hidden_csrf(session),
+           "arts": arts, "table": table}
+    js = r"""<script>
+(function(){
+var slug=%s, csrf=document.querySelector('input[name=csrf]').value;
+// markdown minimo (parrafos, listas, **negrita**) armado como DOM: la respuesta nunca es HTML
+function inl(el, s){ s.split(/(\*\*[^*]+\*\*)/).forEach(function(p){ if(!p) return;
+  if(/^\*\*[^*]+\*\*$/.test(p)){ var b=document.createElement('strong'); b.textContent=p.slice(2,-2); el.appendChild(b); }
+  else el.appendChild(document.createTextNode(p)); }); }
+function paint(box, text){ box.textContent=''; var ul=null;
+  String(text||'').split('\n').forEach(function(line){ var m=line.match(/^\s*(?:[-*\u2022]|\d+[.)])\s+(.*)$/);
+    if(m){ if(!ul){ ul=document.createElement('ul'); box.appendChild(ul); } var li=document.createElement('li'); inl(li, m[1]); ul.appendChild(li); return; }
+    ul=null; if(!line.trim()) return; var p=document.createElement('p'); inl(p, line.replace(/^#+\s*/,'')); box.appendChild(p); }); }
+var ask=document.getElementById('ask'), ans=document.getElementById('answer'), srcs=document.getElementById('srcs');
+ask.addEventListener('submit', async function(ev){ ev.preventDefault();
+  var btn=ask.querySelector('button'); btn.disabled=true; ans.textContent='Buscando en los documentos…'; srcs.textContent='';
+  try{ var r=await fetch('/p/'+slug+'/preguntar',{method:'POST',body:new URLSearchParams(new FormData(ask))});
+    var d=await r.json(); if(!r.ok) throw new Error(d.message||'no se pudo');
+    paint(ans, d.text);
+    (d.sources||[]).forEach(function(s){ var li=document.createElement('li');
+      li.textContent=s.path+(s.heading?' › '+s.heading:''); srcs.appendChild(li); });
+  }catch(e){ ans.textContent='Error: '+e.message; } finally { btn.disabled=false; } });
+var drop=document.getElementById('drop'), files=document.getElementById('files'), log=document.getElementById('log');
+['dragover','dragenter'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.add('on');});});
+['dragleave','drop'].forEach(function(t){drop.addEventListener(t,function(){drop.classList.remove('on');});});
+drop.addEventListener('drop',function(e){e.preventDefault(); files.files=e.dataTransfer.files;});
+document.getElementById('up').addEventListener('click', async function(){
+  var list=[].slice.call(files.files), vis=document.getElementById('pub').checked?'public':'internal', okAny=false;
+  if(!list.length){ log.textContent='Elegí uno o más archivos.'; return; }
+  log.textContent='';
+  for(var i=0;i<list.length;i++){ var f=list[i];
+    var line=document.createElement('div'); line.textContent='… '+f.name; log.appendChild(line);
+    try{ var r=await fetch('/p/'+slug+'/documento?path='+encodeURIComponent(f.name)+'&visibility='+vis,
+           {method:'PUT',body:f,headers:{'X-CSRF':csrf}});
+      var d=await r.json();
+      if(r.ok){ okAny=true; line.textContent='✓ '+f.name+' — '+({created:'nuevo',updated:'actualizado',unchanged:'sin cambios',visibility:'cambió quién lo ve'})[d.status]; }
+      else if(d.error==='secrets'){ line.textContent='✗ '+f.name+' — tiene credenciales en '+d.findings.map(function(x){return 'línea '+x.line+' ('+x.kind+')';}).join(', ')+'. No se subió.'; }
+      else line.textContent='✗ '+f.name+' — '+(d.message||r.status);
+    }catch(e){ line.textContent='✗ '+f.name+' — '+e.message; } }
+  if(okAny) setTimeout(function(){ location.reload(); }, 900); });
+})();
+</script>""" % json.dumps(slug)
+    return layout(d["title"], body, session=session, active="proyectos") + js
+
+
 def page_admin(hub, session, rows, events, team_code=None, notice=None):
     n = '<div class="ok">%s</div>' % esc(notice) if notice else ""
     filas = "".join(
@@ -550,6 +706,65 @@ def page_error(msg, code=404):
 
 # ---------------------------------------------------------------- router web
 
+def _ctx(session):
+    """La sesion web con la forma del contexto de un token, para los metodos del hub."""
+    return {"user_id": session["user_id"], "name": session["name"], "is_admin": session["is_admin"],
+            "token_id": None, "prefix": None}
+
+
+def _serve_project(hub, session, method, slug, action, query, form, raw, ip, out, csrf_header):
+    def jout(status, obj):
+        return out(status, json.dumps(obj, ensure_ascii=False), ctype="application/json; charset=utf-8")
+
+    def fail(exc, as_json):
+        status = getattr(exc, "status", 500)
+        if not hasattr(exc, "status"):
+            raise exc
+        if as_json:
+            return jout(status, dict({"ok": False, "error": exc.code, "message": exc.message}, **(exc.extra or {})))
+        return out(status, page_error(exc.message, status))
+
+    if action is None:
+        try:
+            return out(200, page_project(hub, session, hub.project_detail(slug)))
+        except Exception as exc:
+            return fail(exc, False)
+
+    if action == "documento":
+        # el archivo viaja crudo (no es un formulario): el token CSRF va en un header
+        want = session.get("csrf") or ""
+        if not (csrf_header and want and secrets.compare_digest(csrf_header, want)):
+            return jout(403, {"ok": False, "error": "csrf", "message": "la sesion vencio: recarga la pagina"})
+        if not raw:
+            return jout(400, {"ok": False, "error": "empty", "message": "el archivo esta vacio"})
+        try:
+            r = hub.doc_put(_ctx(session), slug, (query.get("path") or [""])[0], raw,
+                            (query.get("visibility") or [None])[0], ip)
+            return jout(200, dict(r, ok=True))
+        except Exception as exc:
+            return fail(exc, True)
+
+    if not check_csrf(session, form):
+        if action == "preguntar":
+            return jout(403, {"ok": False, "error": "csrf", "message": "la sesion vencio: recarga la pagina"})
+        return out(403, page_error("El formulario venció. Volvé a intentar.", 403))
+    path = (form.get("path") or [""])[0]
+    try:
+        if action == "visibilidad":
+            hub.doc_visibility(_ctx(session), slug, [path], (form.get("visibility") or [""])[0], ip=ip)
+            return out(303, "", location="/p/" + slug)
+        if action == "sacar":
+            hub.doc_delete(_ctx(session), slug, [path], ip=ip)
+            return out(303, "", location="/p/" + slug)
+        q = (form.get("q") or [""])[0].strip()
+        if not q:
+            return jout(400, {"ok": False, "error": "empty", "message": "escribi una pregunta"})
+        hub.check_attempts("webask:%s" % session["user_id"], limit=hub.cfg["kb_searches_per_hour"], window=3600)
+        return jout(200, dict(hub.project_ask(slug, q), ok=True))
+    except Exception as exc:
+        return fail(exc, action == "preguntar")
+
+
 def is_app_host(host, cfg):
     want = (cfg.get("app_host") or "").strip().lower()
     if not want:
@@ -558,11 +773,15 @@ def is_app_host(host, cfg):
     return host == want
 
 
-RUTAS_GET = {"/", "/galeria", "/equipo", "/admin", "/entrar", "/unirse", "/instalar"}
-RUTAS_POST = {"/entrar", "/unirse", "/salir", "/compartir", "/borrar", "/codigo"}
+RUTAS_GET = {"/", "/galeria", "/equipo", "/admin", "/entrar", "/unirse", "/instalar", "/proyectos"}
+RUTAS_POST = {"/entrar", "/unirse", "/salir", "/compartir", "/borrar", "/codigo", "/proyectos"}
+# /p/<proyecto> y sus acciones: (metodo, accion o None)
+PROJECT_RE = re.compile(r"^/p/([a-z0-9][a-z0-9-]{0,60})(?:/(visibilidad|sacar|preguntar|documento))?$")
+PROJECT_ROUTES = {("GET", None), ("HEAD", None), ("POST", "visibilidad"), ("POST", "sacar"),
+                  ("POST", "preguntar"), ("PUT", "documento")}
 
 
-def serve(handler, hub, method, path, query, form):
+def serve(handler, hub, method, path, query, form, raw=None):
     """Atiende un request del hostname de la app. Devuelve (status, ctype, body, cookie, location)."""
     cfg = hub.cfg
     sid = None
@@ -590,7 +809,10 @@ def serve(handler, hub, method, path, query, form):
     # Solo las rutas de la app existen aca. Cualquier otra cosa es 404 — y eso incluye
     # /a/..., que es lo que mantiene los artifacts FUERA del origen de la sesion.
     conocidas = RUTAS_GET if method in ("GET", "HEAD") else RUTAS_POST
-    if path not in conocidas:
+    pm = PROJECT_RE.match(path)
+    if pm and (method, pm.group(2)) not in PROJECT_ROUTES:
+        pm = None
+    if path not in conocidas and not pm:
         return out(404, page_error("No existe esa página.", 404))
 
     # Publica: se lee ANTES de tener cuenta. Va antes del muro de sesion.
@@ -643,9 +865,23 @@ def serve(handler, hub, method, path, query, form):
         drop_session(hub, sid)
         return out(303, "", cookie="%s=; Path=/; Max-Age=0" % COOKIE, location="/entrar")
 
+    if pm:
+        return _serve_project(hub, session, method, pm.group(1), pm.group(2), query, form, raw, ip, out,
+                              handler.headers.get("X-CSRF") or "")
+
     if method == "POST":
         if not check_csrf(session, form):
             return out(403, page_error("El formulario venció. Volvé a intentar.", 403))
+
+    if method == "POST" and path == "/proyectos":
+        slug = (form.get("slug") or [""])[0].strip().lower()
+        try:
+            hub.project_create(_ctx(session), slug, (form.get("title") or [""])[0],
+                               (form.get("description") or [""])[0], ip)
+        except Exception as exc:
+            return out(getattr(exc, "status", 400), page_projects(hub, session, hub.projects(),
+                                                                   error=getattr(exc, "message", str(exc))))
+        return out(303, "", location="/p/" + slug)
 
     if method == "POST" and path == "/compartir":
         slug = (form.get("slug") or [""])[0].strip()
@@ -684,6 +920,8 @@ def serve(handler, hub, method, path, query, form):
         return out(200, page_gallery(hub, session, arts))
     if path == "/equipo":
         return out(200, page_team(hub, session, team_spaces(hub)))
+    if path == "/proyectos":
+        return out(200, page_projects(hub, session, hub.projects()))
     if path == "/admin":
         if not session["is_admin"]:
             return out(403, page_error("Solo un admin.", 403))

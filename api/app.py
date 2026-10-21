@@ -384,7 +384,10 @@ class Hub:
         text = self._kb(hub_kb.extract, path, data)
         if not text.strip():
             raise ApiError(422, "empty", "no encontre texto en '%s'" % path)
-        leaks = hub_kb.scan_secrets(text)
+        # Se revisa el ARCHIVO (asi la linea que se informa es la del archivo, y un secreto en el
+        # <script> de un html tambien cuenta); los binarios (pdf, docx), por su texto.
+        raw_text = data.decode("utf-8", "replace") if hub_kb.ext_of(path) not in (".pdf", ".docx") else text
+        leaks = hub_kb.scan_secrets(raw_text)
         if leaks:
             raise ApiError(422, "secrets", "'%s' tiene algo con forma de credencial: no se indexa. Sacalo del"
                            " documento (o rotalo si es real) y volve a subirlo" % path, {"findings": leaks, "path": path})
@@ -467,6 +470,21 @@ class Hub:
                 cached = (tuple(sig), hub_kb.load_vectors(c, project_id))
                 self._vectors[project_id] = cached
             return hub_kb.search(c, self.cfg, project_id, query, public_only, k, vectors=cached[1])
+
+    def project_ask(self, slug, query, model=None):
+        """El EQUIPO le pregunta al proyecto: busca en TODOS sus documentos y responde con fuentes."""
+        if not hub_ai.enabled(self.cfg):
+            raise ApiError(503, "ai_off", "este hub no tiene IA configurada")
+        with self.db() as c:
+            prow = self.project_row(c, slug)
+        passages = self.kb_search(prow["id"], query, False)
+        try:
+            payload, _ = hub_ai.build(self.cfg, {"system": hub_kb.grounding(passages, prow["title"]),
+                                                 "prompt": query, "model": model})
+            out = hub_ai.complete(self.cfg, payload)
+        except hub_ai.AiError as e:
+            raise ApiError(e.status, e.code, e.message)
+        return {"text": out["text"], "sources": hub_kb.sources_of(passages)}
 
     def project_of_artifact(self, owner, slug):
         """(id, slug, title) del proyecto de un artifact, o None."""
@@ -1231,15 +1249,20 @@ class Handler(BaseHTTPRequestHandler):
     def _web(self, method, raw_path, q):
         """Sirve la interfaz web. Solo cuando el request entra por el hostname de la app."""
         hub = self.hub
-        form = {}
+        form, raw = {}, None
+        n = int(self.headers.get("Content-Length") or 0)
         if method == "POST":
-            n = int(self.headers.get("Content-Length") or 0)
             if 0 < n <= 65536:
                 try:
                     form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
                 except Exception:
                     form = {}
-        status, ctype, payload, cookie, location = hub_web.serve(self, hub, method, raw_path, q, form)
+        elif method == "PUT":
+            # subir un documento desde la app: el archivo crudo, con el CSRF en un header
+            if n > hub.cfg["kb_max_doc_bytes"]:
+                raise ApiError(413, "too_large", "el documento supera %d bytes" % hub.cfg["kb_max_doc_bytes"])
+            raw = self.rfile.read(n) if n > 0 else b""
+        status, ctype, payload, cookie, location = hub_web.serve(self, hub, method, raw_path, q, form, raw)
         body = payload if isinstance(payload, bytes) else (payload or "").encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -1251,7 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
         # la app es server-rendered; sin inline externo salvo el filtro del buscador
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; "
-                         "script-src 'unsafe-inline'; frame-src https:; form-action 'self'; base-uri 'none'")
+                         "script-src 'unsafe-inline'; connect-src 'self'; frame-src https:; form-action 'self'; base-uri 'none'")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         if location:
@@ -1544,20 +1567,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not query:
                     raise ApiError(400, "empty", "falta la pregunta (q)")
                 hub.check_rate(ctx["token_id"])
-                with hub.db() as c:
-                    prow = hub.project_row(c, rest[1])
-                passages = hub.kb_search(prow["id"], query, bool(b.get("public_only")), b.get("k"))
                 if route == "project-search":
-                    return self._send(200, {"ok": True, "passages": passages})
-                if not hub_ai.enabled(hub.cfg):
-                    raise ApiError(503, "ai_off", "este hub no tiene IA configurada")
-                try:
-                    payload, _ = hub_ai.build(hub.cfg, {"system": hub_kb.grounding(passages, prow["title"]),
-                                                        "prompt": query, "model": b.get("model")})
-                    out = hub_ai.complete(hub.cfg, payload)
-                except hub_ai.AiError as e:
-                    raise ApiError(e.status, e.code, e.message)
-                return self._send(200, {"ok": True, "text": out["text"], "sources": hub_kb.sources_of(passages)})
+                    with hub.db() as c:
+                        pid = hub.project_row(c, rest[1])["id"]
+                    return self._send(200, {"ok": True, "passages": hub.kb_search(
+                        pid, query, bool(b.get("public_only")), b.get("k"))})
+                return self._send(200, {"ok": True, **hub.project_ask(rest[1], query, b.get("model"))})
 
             if route == "artifact-project":
                 if method != "PUT":

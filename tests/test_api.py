@@ -1692,6 +1692,10 @@ class TestProyectos(Base):
         s, b = self.doc("zellia", "docs/env.md", "# Config\n\nnada\n\nOPENAI_API_KEY=" + secreto + "\n")
         self.assertEqual((s, b["error"]), (422, "secrets"))
         self.assertEqual(b["findings"][0]["line"], 5)
+        s, b = self.doc("zellia", "docs/env2.md", "# A\n\n\n\n\n   \n\nx\n\nOPENAI_API_KEY=" + secreto + "\n")
+        self.assertEqual(b["findings"][0]["line"], 10, "la linea tiene que ser la del ARCHIVO, no la del texto limpio")
+        s, b = self.doc("zellia", "web/x.html", '<p>hola</p>\n<script>const k="' + secreto + '"</script>')
+        self.assertEqual((s, b["findings"][0]["line"]), (422, 2), "un secreto en el <script> de un html tambien cuenta")
         self.assertNotIn(secreto, json.dumps(b))
         for leak in ("password: Hunter2025x", "postgres://admin:clave123@db:5432/x",
                      "-----BEGIN RSA PRIVATE KEY-----", "token EAA" + "x1" * 40):
@@ -1826,6 +1830,112 @@ class TestProyectos(Base):
         self.assertEqual(b["semantic"], False)
         r = self.jreq("POST", "/api/v1/projects/zellia/search", {"q": "facturación"})[1]["passages"]
         self.assertEqual(r[0]["path"], "docs/a.md", "FTS con acentos debe encontrar igual")
+
+
+class TestWebProyectos(Base):
+    """Los proyectos en la app del equipo: verlos, sumar documentos, decidir que es publico y
+    preguntarle al proyecto (el equipo SI ve lo interno)."""
+    overrides = {"app_host": "app.test", "ai_per_visitor_hour": 1000, "ai_per_page_day": 1000}
+
+    def setUp(self):
+        self.fake = FakeAI()
+        self.overrides = dict(self.overrides, **self.fake.cfg())
+        super().setUp()
+        J = lambda m, p, b: self.req(m, p, token=self.tok_ana, data=json.dumps(b).encode(), ctype="application/json")
+        J("POST", "/api/v1/projects", {"slug": "zellia", "title": "Zellia", "description": "ventas por WhatsApp"})
+        self.req("PUT", "/api/v1/projects/zellia/docs?path=" + urllib.parse.quote("docs/<b>raro</b>.md"),
+                 token=self.tok_ana, data="# Precios <script>x</script>\n\nEl precio interno es 999.".encode(),
+                 ctype="text/markdown")
+        self.req("PUT", "/api/v1/artifacts/pitch?project=zellia", token=self.tok_ana, data=HTML)
+        s, h, _ = TestWeb.web(self, "POST", "/entrar", data={"token": self.tok_beto})
+        self.ck = h.get("Set-Cookie", "").split(";")[0]
+
+    def tearDown(self):
+        super().tearDown(); self.fake.close()
+
+    web = TestWeb.web
+
+    def csrf(self, html):
+        import re
+        return re.search(r'name="csrf" value="([^"]+)"', html).group(1)
+
+    def test_lista_y_detalle_con_todo_escapado(self):
+        s, h, b = self.web("GET", "/proyectos", cookie=self.ck)
+        self.assertEqual(s, 200)
+        self.assertIn("Zellia", b); self.assertIn("ventas por WhatsApp", b)
+        self.assertIn('href="/p/zellia"', b)
+        s, h, b = self.web("GET", "/p/zellia", cookie=self.ck)
+        self.assertEqual(s, 200)
+        self.assertIn("/a/ana/pitch.html", b)
+        self.assertIn("&lt;b&gt;raro&lt;/b&gt;", b)
+        self.assertNotIn("<script>x</script>", b, "el titulo de un documento se pinto como HTML")
+        self.assertIn("connect-src 'self'", h.get("Content-Security-Policy", ""))
+        self.assertEqual(self.web("GET", "/p/no-existe", cookie=self.ck)[0], 404)
+        node = shutil.which("node")
+        if node:          # el JS de la pagina tiene que compilar: un escape mal puesto lo rompia entero
+            import re, subprocess
+            f = os.path.join(self.tmp, "p.js")
+            with open(f, "w") as out:
+                out.write("\n".join(re.findall(r"<script>(.*?)</script>", b, re.S)))
+            r = subprocess.run([node, "--check", f], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.web("GET", "/p/zellia")[0], 303, "sin sesion")
+
+    def test_crear_proyecto_desde_la_app(self):
+        c = self.csrf(self.web("GET", "/proyectos", cookie=self.ck)[2])
+        s, h, b = self.web("POST", "/proyectos", cookie=self.ck,
+                           data={"csrf": c, "slug": "nuevo", "title": "Nuevo", "description": ""})
+        self.assertEqual((s, h.get("Location")), (303, "/p/nuevo"), b[:300])
+        self.assertEqual(self.web("POST", "/proyectos", cookie=self.ck,
+                                  data={"csrf": "malo", "slug": "otro", "title": "x"})[0], 403)
+
+    def test_visibilidad_y_sacar(self):
+        c = self.csrf(self.web("GET", "/p/zellia", cookie=self.ck)[2])
+        path = "docs/<b>raro</b>.md"
+        s, h, b = self.web("POST", "/p/zellia/visibilidad", cookie=self.ck,
+                           data={"csrf": c, "path": path, "visibility": "public"})
+        self.assertEqual(s, 303, b[:300])
+        d = self.req("GET", "/api/v1/projects/zellia", token=self.tok_ana)[1]["documents"]
+        self.assertEqual(d[0]["visibility"], "public")
+        self.assertEqual(self.web("POST", "/p/zellia/sacar", cookie=self.ck, data={"csrf": "x", "path": path})[0], 403)
+        s, h, b = self.web("POST", "/p/zellia/sacar", cookie=self.ck, data={"csrf": c, "path": path})
+        self.assertEqual(s, 303)
+        self.assertEqual(self.req("GET", "/api/v1/projects/zellia", token=self.tok_ana)[1]["documents"], [])
+
+    def test_subir_documento_con_csrf_en_header(self):
+        c = self.csrf(self.web("GET", "/p/zellia", cookie=self.ck)[2])
+        body = "# Horario\n\nAbrimos de 9 a 18.".encode()
+        s, h, b = self.web("PUT", "/p/zellia/documento?path=horario.md&visibility=public", cookie=self.ck,
+                           headers={"X-CSRF": c, "Content-Type": "application/octet-stream"}, data=None)
+        self.assertEqual(s, 400, "sin cuerpo no hay documento")
+        r = urllib.request.Request(self.base + "/p/zellia/documento?path=horario.md&visibility=public", data=body,
+                                   method="PUT", headers={"Host": "app.test", "Cookie": self.ck, "X-CSRF": c})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            out = json.loads(resp.read())
+        self.assertEqual((out["status"], out["visibility"]), ("created", "public"))
+        r = urllib.request.Request(self.base + "/p/zellia/documento?path=otro.md", data=body,
+                                   method="PUT", headers={"Host": "app.test", "Cookie": self.ck, "X-CSRF": "malo"})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(r, timeout=10)
+        self.assertEqual(e.exception.code, 403)
+        r = urllib.request.Request(self.base + "/p/zellia/documento?path=env.md",
+                                   data=("clave\npassword=Sup3rSecreta99").encode(),
+                                   method="PUT", headers={"Host": "app.test", "Cookie": self.ck, "X-CSRF": c})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(r, timeout=10)
+        err = json.loads(e.exception.read())
+        self.assertEqual((e.exception.code, err["error"]), (422, "secrets"))
+        self.assertNotIn("Sup3rSecreta99", json.dumps(err))
+
+    def test_preguntar_al_proyecto_ve_lo_interno(self):
+        c = self.csrf(self.web("GET", "/p/zellia", cookie=self.ck)[2])
+        s, h, b = self.web("POST", "/p/zellia/preguntar", cookie=self.ck, data={"csrf": c, "q": "precio interno"})
+        self.assertEqual(s, 200, b[:300])
+        d = json.loads(b)
+        self.assertTrue(d["text"])
+        self.assertEqual(d["sources"][0]["path"], "docs/<b>raro</b>.md")
+        self.assertIn("999", self.fake.seen[-1]["body"]["messages"][0]["content"])
+        self.assertEqual(self.web("POST", "/p/zellia/preguntar", cookie=self.ck, data={"csrf": "x", "q": "a"})[0], 403)
 
 
 if __name__ == "__main__":
